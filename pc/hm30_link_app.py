@@ -39,21 +39,34 @@ HM30_VID, HM30_PID = 0x0483, 0x5740  # HM30 ground unit USB serial (as seen on W
 DEMO_PORT = "DEMO (fake STM32 data)"
 PAIR_PORT = "PAIR (simulated radio to the other window)"
 BAUDS = ["9600", "38400", "57600", "115200", "230400"]
-PLOT_COLORS = ["#2b7de9", "#e5484d", "#30a46c", "#f5a524", "#8e4ec6", "#12a594", "#d6409f", "#6e6e6e"]
-MAX_LOG_LINES = 3000
+MAX_LINES = 3000
+MAX_LINE_CHARS = 300
 MAX_POINTS = 5000
 MAX_CSV_ROWS = 500_000
-BIG_FILE_ASK = 60  # ask before sending files that would take longer than this (s)
+BIG_FILE_ASK = 60      # ask before sending files that would take longer than this (s)
+EVENT_BUDGET_S = 0.03  # handle incoming data in short slices so the window never freezes
 
 SEND_MODES = ["Text", "Command", "Number", "Bytes (hex)", "Files", "Plain text line"]
 SEND_HINTS = {
-    "Text": "any message  → shown in the other side's Chat",
-    "Command": "LED ON  → STM32 gets a CMD packet (link_receive, type LINK_TYPE_CMD)",
-    "Number": "speed=1.5, angle=-30  → one VALUE packet per name (Values table on the other side)",
-    "Bytes (hex)": "01 02 FF  or  0x01,0x02,0xFF  or  0102FF",
-    "Files": "click Browse… (pick one or more files), then Send. Text-like files are compressed automatically.",
-    "Plain text line": "hello  → plain text + newline, no packet (like typing in PuTTY)",
+    "Text": "Type a message and press Enter. It appears in the other side's Chat.",
+    "Command": "e.g. LED ON — for an STM32 (it arrives as LINK_TYPE_CMD in link_receive).",
+    "Number": "e.g. speed=1.5, angle=-30 — shows up in the other side's Values table and graph.",
+    "Bytes (hex)": "e.g. 01 02 FF  or  0x01,0x02,0xFF  or  0102FF",
+    "Files": "Click Browse… (you can pick several files), then Send. Text files are compressed automatically.",
+    "Plain text line": "Sent as plain text + newline, without confirmation (like typing in PuTTY).",
 }
+
+# ---- look --------------------------------------------------------------------------
+C = {
+    "bg": "#f3f5f9", "card": "#ffffff", "border": "#dde2ea", "text": "#1f2937", "muted": "#6b7280",
+    "header": "#1e293b", "header_text": "#f8fafc", "accent": "#2563eb", "accent_dark": "#1d4ed8",
+    "ok": "#16a34a", "warn": "#d97706", "err": "#dc2626", "info": "#475569", "in": "#2563eb", "out": "#0f766e",
+    "me_bg": "#dcfce7", "me_fg": "#14532d", "them_bg": "#eef2f7", "them_fg": "#1f2937", "grid": "#eef1f5",
+}
+PLOT_COLORS = ["#2563eb", "#dc2626", "#16a34a", "#d97706", "#7c3aed", "#0891b2", "#db2777", "#4b5563"]
+FONT = ("Segoe UI", 10)
+FONT_BOLD = ("Segoe UI", 10, "bold")
+LEVEL_ICON = {"info": "ℹ", "ok": "✔", "warn": "⚠", "err": "✖", "in": "⬇", "out": "⬆", "tech": "·"}
 
 SETTINGS_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "HM30Link", "settings.json")
 
@@ -99,6 +112,27 @@ def open_folder(path: str) -> None:
         subprocess.Popen(["xdg-open", path])
 
 
+def readable(text: str) -> bool:
+    """True for normal text (e.g. printf from an STM32), False for radio noise."""
+    if not text:
+        return False
+    good = sum(ch.isprintable() and ch != "�" for ch in text)
+    return good / len(text) >= 0.9
+
+
+def clip(text: str) -> str:
+    text = "".join(ch if ch.isprintable() else "·" for ch in text)
+    return text if len(text) <= MAX_LINE_CHARS else text[:MAX_LINE_CHARS] + " …"
+
+
+def friendly_error(msg: str) -> str:
+    low = msg.lower()
+    if any(k in low for k in ("access is denied", "permissionerror", "clearcommerror", "device", "could not")):
+        return ("the USB adapter / ground unit was unplugged or stopped responding. "
+                "Check the USB cable, then click Connect.")
+    return msg
+
+
 class Series:
     def __init__(self, color: str) -> None:
         self.points: deque[tuple[float, float]] = deque(maxlen=MAX_POINTS)
@@ -113,6 +147,7 @@ class App:
     def __init__(self, root, *, demo: bool = False, pair_port=None, title: str = "HM30 Link",
                  save_dir: str | None = None, persist: bool = True) -> None:
         self.root = root
+        self.title = title
         self.pair_port = pair_port
         self.persist = persist  # False in --pair / tests: do not touch the user's settings file
         self.settings = load_settings() if persist else {}
@@ -122,7 +157,6 @@ class App:
         self.worker: core.LinkWorker | None = None
         self.series: dict[str, Series] = {}
         self.csv_rows: list[tuple] = []
-        self.rx_bytes = 0
         self.last_rx = 0.0
         self.rate_hist: deque[tuple[float, int]] = deque()
         self.paused = False
@@ -130,163 +164,254 @@ class App:
         self.history_pos = 0
         self.file_paths: list[str] = []
         self.file_cancel: threading.Event | None = None
+        self._file_token: int | None = None
         self.incoming: dict[int, tuple[proto.IncomingFile, float, dict]] = {}
         self.chat_marks: dict[int, dict] = {}  # token -> {"mark", "left", "failed"}
         self.session_file = None
         self.session_csv = None
+        self.noise_bytes = 0
+        self._noise_reported = 0.0
+        self._quality_mark: tuple[float, int, int, int] | None = None
+        self._scroll: set = set()
+        self.lost_connection = False
 
         root.title(title)
-        root.geometry("1240x800")
-        root.minsize(980, 600)
+        root.geometry("1280x820")
+        root.minsize(1000, 640)
+        root.configure(bg=C["bg"])
+        self._style()
         self._build_ui()
         self.refresh_ports(select=DEMO_PORT if demo else PAIR_PORT if pair_port else None)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(50, self.poll_events)
         root.after(500, self.update_status)
-        root.after(100, self.redraw_plot)
+        root.after(150, self.redraw_plot)
+        self.note("info", "Welcome! Choose the port, set the same baud on both sides, then click Connect.")
         if demo or pair_port:
             self.connect()
         elif not self._save_dir_ok():
             root.after(400, lambda: self.choose_save_dir(first_time=True))
 
+    # ---- look ---------------------------------------------------------------
+
+    def _style(self) -> None:
+        s = ttk.Style(self.root)
+        s.theme_use("clam")
+        s.configure(".", background=C["bg"], foreground=C["text"], font=FONT, bordercolor=C["border"],
+                    lightcolor=C["border"], darkcolor=C["border"], focuscolor=C["accent"])
+        s.configure("TFrame", background=C["bg"])
+        s.configure("Card.TFrame", background=C["card"], relief="flat", borderwidth=0)
+        s.configure("Header.TFrame", background=C["header"])
+        s.configure("Header.TLabel", background=C["header"], foreground=C["header_text"], font=("Segoe UI", 14, "bold"))
+        s.configure("Sub.TLabel", background=C["header"], foreground="#94a3b8", font=("Segoe UI", 9))
+        s.configure("TLabel", background=C["bg"])
+        s.configure("Card.TLabel", background=C["card"])
+        s.configure("Muted.TLabel", background=C["bg"], foreground=C["muted"], font=("Segoe UI", 9))
+        s.configure("CardMuted.TLabel", background=C["card"], foreground=C["muted"], font=("Segoe UI", 9))
+        s.configure("Path.TLabel", background=C["card"], foreground=C["accent"])
+        s.configure("Title.TLabel", background=C["card"], font=("Segoe UI", 10, "bold"))
+        s.configure("TButton", padding=(10, 4), background="#e9edf3", relief="flat")
+        s.map("TButton", background=[("active", "#dbe2ec"), ("disabled", "#f1f3f6")],
+              foreground=[("disabled", "#9ca3af")])
+        s.configure("Accent.TButton", background=C["accent"], foreground="white", font=FONT_BOLD, padding=(14, 5))
+        s.map("Accent.TButton", background=[("active", C["accent_dark"]), ("disabled", "#93c5fd")])
+        s.configure("Danger.TButton", background="#fee2e2", foreground=C["err"], font=FONT_BOLD, padding=(14, 5))
+        s.map("Danger.TButton", background=[("active", "#fecaca")])
+        s.configure("TCombobox", fieldbackground="white", background="white", arrowsize=14, padding=3)
+        s.map("TCombobox", fieldbackground=[("readonly", "white")], selectbackground=[("readonly", "white")],
+              selectforeground=[("readonly", C["text"])], background=[("readonly", "white")])
+        s.configure("TEntry", fieldbackground="white", padding=5)
+        s.configure("TCheckbutton", background=C["card"])
+        s.configure("TNotebook", background=C["card"], borderwidth=0, tabmargins=(4, 4, 4, 0))
+        s.configure("TNotebook.Tab", padding=(16, 6), font=FONT, background="#e9edf3")
+        s.map("TNotebook.Tab", background=[("selected", C["card"])], font=[("selected", FONT_BOLD)])
+        s.configure("Treeview", rowheight=26, fieldbackground="white", background="white", borderwidth=0)
+        s.configure("Treeview.Heading", font=FONT_BOLD, background="#eef1f5", relief="flat")
+        s.configure("Green.Horizontal.TProgressbar", troughcolor="#e5e7eb", background=C["ok"],
+                    bordercolor="#e5e7eb", lightcolor=C["ok"], darkcolor=C["ok"], thickness=12)
+        s.configure("TPanedwindow", background=C["bg"])
+
+    def _card(self, parent, **pack) -> ttk.Frame:
+        outer = tk.Frame(parent, bg=C["border"], bd=0)
+        outer.pack(**pack)
+        inner = ttk.Frame(outer, style="Card.TFrame", padding=10)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        return inner
+
     # ---- layout -------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        style = ttk.Style(self.root)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
+        header = ttk.Frame(self.root, style="Header.TFrame", padding=(14, 10))
+        header.pack(fill="x")
+        ttk.Label(header, text="HM30 Link", style="Header.TLabel").pack(side="left")
+        ttk.Label(header, text="  data over the SIYI HM30 radio", style="Sub.TLabel").pack(side="left", pady=(4, 0))
+        self.badge = tk.Label(header, text="● Disconnected", font=FONT_BOLD, fg="white", bg="#64748b",
+                              padx=12, pady=3)
+        self.badge.pack(side="right")
 
-        top = ttk.Frame(self.root, padding=(8, 8, 8, 2))
-        top.pack(fill="x")
-        ttk.Label(top, text="Port").pack(side="left")
+        self.status = ttk.Label(self.root, padding=(14, 4, 14, 6), anchor="w", style="Muted.TLabel")
+        self.status.pack(fill="x", side="bottom")
+
+        body = ttk.Frame(self.root, padding=(10, 8, 10, 0))
+        body.pack(fill="both", expand=True)
+
+        # connection card
+        conn = self._card(body, fill="x")
+        row = ttk.Frame(conn, style="Card.TFrame")
+        row.pack(fill="x")
+        ttk.Label(row, text="Port", style="Card.TLabel").pack(side="left")
         self.port_var = tk.StringVar()
-        self.port_box = ttk.Combobox(top, textvariable=self.port_var, width=46, state="readonly")
-        self.port_box.pack(side="left", padx=(4, 4))
-        ttk.Button(top, text="⟳", width=3, command=self.refresh_ports).pack(side="left")
-        ttk.Label(top, text="Baud").pack(side="left", padx=(12, 0))
+        self.port_box = ttk.Combobox(row, textvariable=self.port_var, width=48, state="readonly")
+        self.port_box.pack(side="left", padx=(6, 4))
+        ttk.Button(row, text="⟳", width=3, command=self.refresh_ports).pack(side="left")
+        ttk.Label(row, text="Baud", style="Card.TLabel").pack(side="left", padx=(16, 0))
         self.baud_var = tk.StringVar(value=str(self.settings.get("baud", "115200")))
-        baud_box = ttk.Combobox(top, textvariable=self.baud_var, values=BAUDS, width=8, state="readonly")
-        baud_box.pack(side="left", padx=4)
+        baud_box = ttk.Combobox(row, textvariable=self.baud_var, values=BAUDS, width=8, state="readonly")
+        baud_box.pack(side="left", padx=6)
         baud_box.bind("<<ComboboxSelected>>", lambda _e: self._on_baud_change())
-        self.connect_btn = ttk.Button(top, text="Connect", command=self.toggle_connect)
-        self.connect_btn.pack(side="left", padx=(12, 0))
-        self.link_lbl = tk.Label(top, text="●  disconnected", fg="#888", font=("Segoe UI", 10, "bold"))
-        self.link_lbl.pack(side="left", padx=16)
-        ttk.Button(top, text="Save CSV…", command=self.save_csv).pack(side="right")
-        ttk.Button(top, text="Clear", command=self.clear_all).pack(side="right", padx=4)
-        self.pause_btn = ttk.Button(top, text="Pause", command=self.toggle_pause)
+        self.connect_btn = ttk.Button(row, text="Connect", style="Accent.TButton", command=self.toggle_connect)
+        self.connect_btn.pack(side="left", padx=(10, 0))
+        ttk.Button(row, text="Save CSV…", command=self.save_csv).pack(side="right")
+        ttk.Button(row, text="Clear", command=self.clear_all).pack(side="right", padx=6)
+        self.pause_btn = ttk.Button(row, text="Pause", command=self.toggle_pause)
         self.pause_btn.pack(side="right")
-
-        folder = ttk.Frame(self.root, padding=(8, 0, 8, 2))
-        folder.pack(fill="x")
-        ttk.Label(folder, text="Received files and logs go to:").pack(side="left")
-        self.folder_lbl = ttk.Label(folder, text="", foreground="#2b5fb4")
+        row2 = ttk.Frame(conn, style="Card.TFrame")
+        row2.pack(fill="x", pady=(8, 0))
+        ttk.Label(row2, text="Received files and logs:", style="CardMuted.TLabel").pack(side="left")
+        self.folder_lbl = ttk.Label(row2, text="", style="Path.TLabel")
         self.folder_lbl.pack(side="left", padx=6)
-        ttk.Button(folder, text="Change…", command=self.choose_save_dir).pack(side="left")
-        ttk.Button(folder, text="📂 Open", command=self.open_save_dir).pack(side="left", padx=4)
+        ttk.Button(row2, text="Change…", command=self.choose_save_dir).pack(side="left")
+        ttk.Button(row2, text="Open folder", command=self.open_save_dir).pack(side="left", padx=6)
         self._show_save_dir()
 
-        main = ttk.PanedWindow(self.root, orient="horizontal")
-        main.pack(fill="both", expand=True, padx=8, pady=4)
-
-        # left: Chat / Log tabs
-        left = ttk.Frame(main)
-        main.add(left, weight=3)
-        self.tabs = ttk.Notebook(left)
-        self.tabs.pack(fill="both", expand=True)
-        self.chat = self._text_tab("Chat", wrap="word", font=("Segoe UI", 10))
-        self.log = self._text_tab("Log", wrap="none", font=("Consolas", 10))
-        for widget in (self.chat, self.log):
-            widget.tag_configure("time", foreground="#777")
-        self.chat.tag_configure("me", foreground="#6fd18f")
-        self.chat.tag_configure("them", foreground="#e6e6e6")
-        self.chat.tag_configure("who_me", foreground="#3fae6a", font=("Segoe UI", 10, "bold"))
-        self.chat.tag_configure("who_them", foreground="#7fb8ff", font=("Segoe UI", 10, "bold"))
-        self.chat.tag_configure("file", foreground="#f5c26b")
-        self.chat.tag_configure("ok", foreground="#3fae6a")
-        self.chat.tag_configure("bad", foreground="#ff6b6b")
-        self.chat.tag_configure("info", foreground="#c9a0ff")
-        for tag, color in (("TEXT", "#e6e6e6"), ("RAW", "#b5b5b5"), ("VALUE", "#7fb8ff"), ("BYTES", "#f5c26b"),
-                           ("SENT", "#6fd18f"), ("ACKED", "#3fae6a"), ("INFO", "#c9a0ff"), ("ERROR", "#ff6b6b")):
-            self.log.tag_configure(tag, foreground=color)
-        opts = ttk.Frame(left)
-        opts.pack(fill="x", pady=(4, 0))
-        self.show_values_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Show value packets in Log", variable=self.show_values_var).pack(side="left")
-        self.autoscroll_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="Auto-scroll", variable=self.autoscroll_var).pack(side="left", padx=12)
-
-        # right: values table + graph
-        right = ttk.PanedWindow(main, orient="vertical")
-        main.add(right, weight=4)
-        table_frame = ttk.Frame(right)
-        right.add(table_frame, weight=2)
-        ttk.Label(table_frame, text="Values  (click a row to show/hide it on the graph)").pack(anchor="w")
-        cols = ("plot", "value", "min", "max", "count", "age")
-        self.table = ttk.Treeview(table_frame, columns=cols, height=7)
-        self.table.heading("#0", text="Name")
-        self.table.column("#0", width=140)
-        for c, w, title in (("plot", 50, "Graph"), ("value", 110, "Value"), ("min", 90, "Min"),
-                            ("max", 90, "Max"), ("count", 70, "Count"), ("age", 70, "Age (s)")):
-            self.table.heading(c, text=title)
-            self.table.column(c, width=w, anchor="e" if c != "plot" else "center")
-        self.table.pack(fill="both", expand=True)
-        self.table.bind("<ButtonRelease-1>", self.on_table_click)
-
-        plot_frame = ttk.Frame(right)
-        right.add(plot_frame, weight=3)
-        bar = ttk.Frame(plot_frame)
-        bar.pack(fill="x")
-        ttk.Label(bar, text="Graph window").pack(side="left")
-        self.window_var = tk.StringVar(value="30 s")
-        ttk.Combobox(bar, textvariable=self.window_var, values=["10 s", "30 s", "60 s", "5 min"], width=7,
-                     state="readonly").pack(side="left", padx=4)
-        self.canvas = tk.Canvas(plot_frame, bg="#111", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True, pady=(4, 0))
-
-        # bottom: send box
-        send = ttk.Frame(self.root, padding=(8, 4, 8, 2))
+        # send card
+        send_card = self._card(body, fill="x", side="bottom", pady=(0, 2))
+        send = ttk.Frame(send_card, style="Card.TFrame")
         send.pack(fill="x")
-        ttk.Label(send, text="Send").pack(side="left")
+        ttk.Label(send, text="Send", style="Title.TLabel").pack(side="left")
         self.send_mode = tk.StringVar(value=SEND_MODES[0])
         mode_box = ttk.Combobox(send, textvariable=self.send_mode, values=SEND_MODES, width=15, state="readonly")
-        mode_box.pack(side="left", padx=(6, 0))
+        mode_box.pack(side="left", padx=(8, 0))
         mode_box.bind("<<ComboboxSelected>>", lambda _e: self._on_mode_change())
         self.send_var = tk.StringVar()
-        self.entry = ttk.Entry(send, textvariable=self.send_var)
-        self.entry.pack(side="left", fill="x", expand=True, padx=6)
+        self.entry = ttk.Entry(send, textvariable=self.send_var, font=("Segoe UI", 11))
+        self.entry.pack(side="left", fill="x", expand=True, padx=8)
         self.entry.bind("<Return>", lambda _e: self.send())
         self.entry.bind("<Up>", lambda _e: self._history_step(-1))
         self.entry.bind("<Down>", lambda _e: self._history_step(1))
         self.entry.bind("<Key>", lambda _e: self.file_paths.clear() if self.send_mode.get() == "Files" else None)
         self.browse_btn = ttk.Button(send, text="Browse…", command=self.browse_files)
         self.browse_btn.pack(side="left")
-        self.send_btn = ttk.Button(send, text="Send", command=self.send)
-        self.send_btn.pack(side="left", padx=(6, 0))
-
-        prog = ttk.Frame(self.root, padding=(8, 0, 8, 0))
-        prog.pack(fill="x")
-        self.hint = ttk.Label(prog, foreground="#666", anchor="w")
+        self.send_btn = ttk.Button(send, text="Send  ➤", style="Accent.TButton", command=self.send)
+        self.send_btn.pack(side="left", padx=(8, 0))
+        prog = ttk.Frame(send_card, style="Card.TFrame")
+        prog.pack(fill="x", pady=(8, 0))
+        self.hint = ttk.Label(prog, style="CardMuted.TLabel", anchor="w")
         self.hint.pack(side="left", fill="x", expand=True)
-        self.progress_lbl = ttk.Label(prog, text="", anchor="e")
-        self.progress_lbl.pack(side="right", padx=(8, 0))
-        self.progress = ttk.Progressbar(prog, length=260, mode="determinate", maximum=1000)
+        self.progress_lbl = ttk.Label(prog, text="", style="Card.TLabel", anchor="e")
+        self.progress_lbl.pack(side="right", padx=(10, 0))
+        self.progress = ttk.Progressbar(prog, length=280, mode="determinate", maximum=1000,
+                                        style="Green.Horizontal.TProgressbar")
         self.progress.pack(side="right")
         self._on_mode_change()
 
-        self.status = ttk.Label(self.root, padding=(8, 2, 8, 6), anchor="w")
-        self.status.pack(fill="x")
+        main = ttk.PanedWindow(body, orient="horizontal")
+        main.pack(fill="both", expand=True, pady=8)
+
+        # left: Chat / Log
+        left_outer = tk.Frame(main, bg=C["border"])
+        main.add(left_outer, weight=3)
+        left = ttk.Frame(left_outer, style="Card.TFrame", padding=(6, 6, 6, 6))
+        left.pack(fill="both", expand=True, padx=1, pady=1)
+        self.tabs = ttk.Notebook(left)
+        self.tabs.pack(fill="both", expand=True)
+        self.chat = self._text_tab("  Chat  ", font=("Segoe UI", 10), bg="white", wrap="word")
+        self.log_text = self._text_tab("  Log  ", font=("Segoe UI", 9), bg="#fbfcfe", wrap="word")
+        self._chat_tags()
+        self._log_tags()
+        opts = ttk.Frame(left, style="Card.TFrame")
+        opts.pack(fill="x", pady=(6, 0))
+        self.tech_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="Show technical details in Log", variable=self.tech_var,
+                        command=self._apply_tech).pack(side="left")
+        self.autoscroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts, text="Auto-scroll", variable=self.autoscroll_var).pack(side="left", padx=14)
+
+        # right: values + graph
+        right = ttk.PanedWindow(main, orient="vertical")
+        main.add(right, weight=4)
+        vals_outer = tk.Frame(right, bg=C["border"])
+        right.add(vals_outer, weight=2)
+        vals = ttk.Frame(vals_outer, style="Card.TFrame", padding=8)
+        vals.pack(fill="both", expand=True, padx=1, pady=1)
+        ttk.Label(vals, text="Values", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(vals, text="Numbers the other side sends. Click a row to show or hide it on the graph.",
+                  style="CardMuted.TLabel").pack(anchor="w", pady=(0, 4))
+        cols = ("plot", "value", "min", "max", "count", "age")
+        self.table = ttk.Treeview(vals, columns=cols, height=6)
+        self.table.heading("#0", text="Name")
+        self.table.column("#0", width=150)
+        for c, w, title in (("plot", 60, "Graph"), ("value", 110, "Value"), ("min", 90, "Min"),
+                            ("max", 90, "Max"), ("count", 70, "Count"), ("age", 70, "Age (s)")):
+            self.table.heading(c, text=title)
+            self.table.column(c, width=w, anchor="e" if c != "plot" else "center")
+        self.table.pack(fill="both", expand=True)
+        self.table.bind("<ButtonRelease-1>", self.on_table_click)
+
+        plot_outer = tk.Frame(right, bg=C["border"])
+        right.add(plot_outer, weight=3)
+        plot = ttk.Frame(plot_outer, style="Card.TFrame", padding=8)
+        plot.pack(fill="both", expand=True, padx=1, pady=1)
+        bar = ttk.Frame(plot, style="Card.TFrame")
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Graph", style="Title.TLabel").pack(side="left")
+        self.window_var = tk.StringVar(value="30 s")
+        ttk.Combobox(bar, textvariable=self.window_var, values=["10 s", "30 s", "60 s", "5 min"], width=7,
+                     state="readonly").pack(side="right")
+        ttk.Label(bar, text="last", style="CardMuted.TLabel").pack(side="right", padx=4)
+        self.canvas = tk.Canvas(plot, bg="white", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, pady=(6, 0))
 
     def _text_tab(self, title: str, **kw) -> tk.Text:
-        frame = ttk.Frame(self.tabs)
+        frame = ttk.Frame(self.tabs, style="Card.TFrame")
         self.tabs.add(frame, text=title)
-        text = tk.Text(frame, state="disabled", bg="#111", fg="#ddd", insertbackground="#ddd",
-                       padx=6, pady=4, **kw)
+        text = tk.Text(frame, state="disabled", fg=C["text"], relief="flat", padx=10, pady=8,
+                       highlightthickness=0, spacing1=2, spacing3=2, cursor="arrow", **kw)
         sb = ttk.Scrollbar(frame, command=text.yview)
         text.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         text.pack(side="left", fill="both", expand=True)
         return text
+
+    def _chat_tags(self) -> None:
+        c = self.chat
+        c.tag_configure("time", foreground="#9ca3af", font=("Segoe UI", 8))
+        c.tag_configure("me", background=C["me_bg"], foreground=C["me_fg"], justify="right",
+                        lmargin1=140, lmargin2=140, rmargin=10, spacing1=4, spacing3=4)
+        c.tag_configure("them", background=C["them_bg"], foreground=C["them_fg"], justify="left",
+                        lmargin1=10, lmargin2=10, rmargin=140, spacing1=4, spacing3=4)
+        c.tag_configure("who", font=("Segoe UI", 8, "bold"), foreground="#9ca3af", spacing1=8)
+        c.tag_configure("me_head", justify="right", rmargin=10)
+        c.tag_configure("them_head", justify="left", lmargin1=10)
+        c.tag_configure("link", foreground=C["accent"], underline=True)
+        c.tag_bind("link", "<Enter>", lambda _e: c.configure(cursor="hand2"))
+        c.tag_bind("link", "<Leave>", lambda _e: c.configure(cursor="arrow"))
+        c.tag_configure("center", justify="center", foreground=C["muted"], font=("Segoe UI", 9, "italic"),
+                        spacing1=8, spacing3=8)
+        c.tag_configure("file", foreground="#92400e")
+        c.tag_configure("ok", foreground=C["ok"], font=FONT_BOLD)
+        c.tag_configure("bad", foreground=C["err"], font=FONT_BOLD)
+
+    def _log_tags(self) -> None:
+        lg = self.log_text
+        lg.tag_configure("time", foreground="#9ca3af", font=("Consolas", 9))
+        for level in ("info", "ok", "warn", "err", "in", "out"):
+            lg.tag_configure(level, foreground=C[level])
+        lg.tag_configure("icon", font=("Segoe UI Symbol", 10, "bold"))
+        lg.tag_configure("tech", foreground="#9ca3af", font=("Consolas", 9), elide=True)
+
+    def _apply_tech(self) -> None:
+        self.log_text.tag_configure("tech", elide=not self.tech_var.get())
 
     # ---- save folder / settings ---------------------------------------------
 
@@ -319,8 +444,8 @@ class App:
         self.settings["save_dir"] = d = os.path.normpath(d)
         self._persist()
         self._show_save_dir()
-        self.log_line("INFO", f"Received files and logs will be saved to {d}")
-        if self.worker:  # start a new session log in the new place
+        self.note("info", f"Received files and logs will be saved to {d}")
+        if self.worker:
             self._open_session_log()
 
     def open_save_dir(self) -> None:
@@ -336,8 +461,8 @@ class App:
         self.settings["baud"] = self.baud_var.get()
         self._persist()
         if self.worker:
-            self.log_line("INFO", "Baud changed: disconnect and connect again to use it. "
-                                  "The HM30 menu and the other side must use the same baud.")
+            self.note("warn", "Baud changed. Click Disconnect, then Connect to use it. Both apps and the "
+                              "ground unit menu (Baud) must use the same value.")
 
     def _ensure_dir(self, sub: str = "") -> str | None:
         d = os.path.join(self.save_dir(), sub) if sub else self.save_dir()
@@ -345,7 +470,7 @@ class App:
             os.makedirs(d, exist_ok=True)
             return d
         except OSError as exc:
-            self.log_line("ERROR", f"Cannot write to {d}: {exc}. Click \"Change…\" to pick another folder.")
+            self.note("err", f"Cannot write to {d}: {exc}. Click \"Change…\" to pick another folder.")
             return None
 
     def _open_session_log(self) -> None:
@@ -358,9 +483,9 @@ class App:
             self.session_file = open(path, "w", newline="", encoding="utf-8")
             self.session_csv = csv.writer(self.session_file)
             self.session_csv.writerow(["time", "direction", "kind", "name", "value"])
-            self.log_line("INFO", f"Logging everything to {path}")
+            self.note("info", f"Everything in this session is saved to {path}", tech=True)
         except OSError as exc:
-            self.log_line("ERROR", f"Cannot create the log file: {exc}")
+            self.note("err", f"Cannot create the session log: {exc}")
             self.session_file = self.session_csv = None
 
     def _close_session_log(self) -> None:
@@ -379,8 +504,10 @@ class App:
             for p in sorted(serial.tools.list_ports.comports(), key=lambda p: p.device):
                 is_hm30 = p.vid == HM30_VID and p.pid == HM30_PID
                 label = f"{p.device} — {'HM30 ground unit' if is_hm30 else (p.description or 'serial port')}"
+                if "bluetooth" in label.lower():
+                    continue  # Bluetooth COM ports are never the HM30 link
                 items.append(label)
-                if is_hm30 and best is None:
+                if best is None and (is_hm30 or p.vid is not None):
                     best = label
         if self.pair_port is not None:
             items.append(PAIR_PORT)
@@ -394,6 +521,7 @@ class App:
     def toggle_connect(self) -> None:
         if self.worker:
             self.disconnect()
+            self.note("info", "Disconnected.")
         else:
             self.connect()
 
@@ -412,13 +540,18 @@ class App:
                 device = label.split(" — ")[0]
                 port = serial.Serial(device, int(self.baud_var.get()), timeout=0.1, write_timeout=2)
         except Exception as exc:
+            self.note("err", f"Could not open {label.split(' — ')[0]}: {exc}")
             messagebox.showerror("HM30 Link", f"Could not open {label}:\n\n{exc}\n\n"
-                                 "Close PuTTY or any other program using the port.")
+                                 "Close PuTTY or any other program using the port, check the USB cable, "
+                                 "then try again.")
             return
         self.worker = core.LinkWorker(port, self.events)
         self.worker.start()
-        self.connect_btn.configure(text="Disconnect")
-        self.log_line("INFO", f"Connected to {label} @ {self.baud_var.get()} baud")
+        self.lost_connection = False
+        self.connect_btn.configure(text="Disconnect", style="Danger.TButton")
+        self.note("info", f"Connected to {label.split(' — ')[0]} at {self.baud_var.get()} baud. "
+                          "Waiting for the other side to answer…")
+        self._quality_mark = None
         self._open_session_log()
 
     def disconnect(self) -> None:
@@ -427,7 +560,7 @@ class App:
         if self.worker:
             self.worker.stop()
             self.worker = None
-        self.connect_btn.configure(text="Connect")
+        self.connect_btn.configure(text="Connect", style="Accent.TButton")
         self.incoming.clear()
         self._close_session_log()
 
@@ -438,51 +571,68 @@ class App:
     # ---- receiving ----------------------------------------------------------
 
     def poll_events(self) -> None:
+        start = time.perf_counter()
         try:
-            for _ in range(800):
+            while time.perf_counter() - start < EVENT_BUDGET_S:
                 ev = self.events.get_nowait()
-                kind = ev[0]
-                if kind == "rx":
-                    _, ts, nbytes, items = ev
-                    self.rx_bytes += nbytes
-                    self.last_rx = time.monotonic()
-                    for item in items:
-                        self.handle_item(ts, item)
-                elif kind == "error":
-                    self.log_line("ERROR", f"Connection lost: {ev[1]}")
-                    self.chat_line("info", "Connection lost: " + ev[1])
-                    self.disconnect()
-                elif kind == "closed":
-                    self.log_line("INFO", "Port closed")
-                elif kind == "info":
-                    self.log_line("INFO", ev[1])
-                elif kind == "peer":
-                    if ev[1]:
-                        self.log_line("INFO", "The other side is the HM30 Link app: messages and files are confirmed")
-                        self.chat_line("info", "Other app connected")
-                elif kind in ("delivered", "failed"):
-                    self.on_delivery(kind == "delivered", *ev[1:])
-                elif kind == "file_begin":
-                    self.on_file_begin(ev[1])
-                elif kind == "progress":
-                    self.show_progress(ev[1])
-                elif kind == "file_sent":
-                    self.on_file_sent(ev[1])
-                elif kind == "files_done":
-                    self.file_cancel = None
-                    self.send_btn.configure(text="Send")
+                self._handle_event(ev)
         except queue.Empty:
             pass
-        self.root.after(50, self.poll_events)
+        for widget in self._scroll:  # scroll once per slice, not once per line
+            widget.see("end")
+        self._scroll.clear()
+        more = not self.events.empty()
+        self.root.after(5 if more else 50, self.poll_events)
+
+    def _handle_event(self, ev) -> None:
+        kind = ev[0]
+        if kind == "rx":
+            _, ts, _nbytes, items = ev
+            self.last_rx = time.monotonic()
+            for item in items:
+                self.handle_item(ts, item)
+        elif kind == "error":
+            msg = friendly_error(ev[1])
+            self.note("err", f"Connection lost: {msg}")
+            self.note("tech", f"error: {ev[1]}", tech=True)
+            self.chat_center(f"Connection lost — {msg}", bad=True)
+            self.lost_connection = True
+            self.disconnect()
+        elif kind == "closed":
+            self.note("tech", "port closed", tech=True)
+        elif kind == "info":
+            self.note("tech", ev[1], tech=True)
+        elif kind == "peer":
+            if ev[1]:
+                self.note("ok", "The other app answered — you can send and receive messages and files.")
+                self.chat_center("Other app connected")
+            else:
+                self.note("info", "The other app reconnected.", tech=True)
+        elif kind in ("delivered", "failed"):
+            self.on_delivery(kind == "delivered", *ev[1:])
+        elif kind == "file_begin":
+            self.on_file_begin(ev[1])
+        elif kind == "progress":
+            self.show_progress(ev[1])
+        elif kind == "file_sent":
+            self.on_file_sent(ev[1])
+        elif kind == "files_done":
+            self.file_cancel = None
+            self.send_btn.configure(text="Send  ➤", style="Accent.TButton")
 
     def handle_item(self, ts: float, item) -> None:
         stamp = datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3]
         peer_app = bool(self.worker and self.worker.peer_is_app)
         if isinstance(item, proto.RawLine):
-            if item.text.strip():
-                self.log_line("RAW", item.text, ts)
-                self.chat_line("them", item.text, ts)
-                self._record(stamp, "in", "raw", "", item.text)
+            text = item.text.strip()
+            if not text:
+                return
+            if readable(text):  # e.g. printf from an STM32
+                self.note("in", f"Text: {clip(text)}")
+                self.chat_bubble("them", clip(text), ts)
+                self._record(stamp, "in", "raw", "", text)
+            else:  # radio noise / wrong baud / two devices on one UART: count it, do not draw it
+                self.noise_bytes += len(text)
             return
         t = item.ftype
         if t == proto.TYPE_VALUE:
@@ -498,16 +648,17 @@ class App:
             s.vmin = min(s.vmin, value)
             s.vmax = max(s.vmax, value)
             self._record(stamp, "in", "value", name, f"{value:.6g}")
-            if self.show_values_var.get():
-                self.log_line("VALUE", f"{name} = {value:.6g}", ts)
-            if peer_app:  # an STM32 streams values all the time: keep those out of the chat
-                self.chat_line("them", f"{name} = {value:.6g}", ts)
+            if peer_app:  # an STM32 streams values all the time: keep those out of chat and log
+                self.note("in", f"Number: {clip(name)} = {value:.6g}")
+                self.chat_bubble("them", f"{clip(name)} = {value:.6g}", ts)
+            else:
+                self.note("tech", f"value {clip(name)} = {value:.6g}", tech=True)
         elif t == proto.TYPE_BYTES:
             hexs = item.payload.hex(" ")
-            self.log_line("BYTES", f"[{len(item.payload)} bytes] {hexs}", ts)
+            self.note("in", f"Bytes ({len(item.payload)}): {clip(hexs)}")
             self._record(stamp, "in", "bytes", "", hexs)
             if peer_app:
-                self.chat_line("them", f"[{len(item.payload)} bytes] {hexs[:120]}", ts)
+                self.chat_bubble("them", f"[{len(item.payload)} bytes] {clip(hexs)}", ts)
         elif t == proto.TYPE_FILE_START:
             self.on_file_start(item.payload)
         elif t == proto.TYPE_FILE_DATA:
@@ -515,11 +666,11 @@ class App:
         elif t == proto.TYPE_FILE_END:
             self.on_file_end(item.payload, stamp)
         else:  # TEXT, CMD, unknown types
-            text = item.text()
-            prefix = "" if t == proto.TYPE_TEXT else f"[{item.type_name}] "
-            self.log_line("TEXT", prefix + text, ts)
-            self.chat_line("them", prefix + text, ts)
-            self._record(stamp, "in", "text" if t == proto.TYPE_TEXT else item.type_name.lower(), "", text)
+            text = clip(item.text())
+            what = "Message" if t == proto.TYPE_TEXT else "Command" if t == proto.TYPE_CMD else item.type_name
+            self.note("in", f"{what}: {text}")
+            self.chat_bubble("them", text if t == proto.TYPE_TEXT else f"[{what}] {text}", ts)
+            self._record(stamp, "in", "text" if t == proto.TYPE_TEXT else item.type_name.lower(), "", item.text())
 
     def _record(self, stamp: str, direction: str, kind: str, name: str, value: str) -> None:
         if len(self.csv_rows) < MAX_CSV_ROWS:
@@ -536,13 +687,13 @@ class App:
         try:
             f = proto.IncomingFile.from_start(payload)
         except proto.FileError as exc:
-            self.log_line("ERROR", f"Bad file header: {exc}")
+            self.note("err", f"A file could not be started: {exc}")
             return
         info = {"name": f.name, "index": 1, "count": 1, "size": f.original_size, "sent_size": f.sent_size,
                 "compressed": bool(f.flags & proto.FILE_ZLIB)}
         self.incoming[f.fid] = (f, time.monotonic(), info)
-        extra = f", compressed to {human_size(f.sent_size)}" if info["compressed"] else ""
-        self.log_line("INFO", f"Receiving file {f.name} ({human_size(f.original_size)}{extra})")
+        extra = f" (compressed to {human_size(f.sent_size)} for the radio)" if info["compressed"] else ""
+        self.note("in", f"Receiving file {f.name} — {human_size(f.original_size)}{extra}…")
         self.show_progress(core.receive_progress(info, 0.0, time.monotonic()))
 
     def on_file_data(self, payload: bytes) -> None:
@@ -553,7 +704,7 @@ class App:
         try:
             f.add(payload)
         except proto.FileError as exc:
-            self.log_line("ERROR", f"File {f.name}: {exc}")
+            self.note("tech", f"file {f.name}: {exc}", tech=True)
             return
         now = time.monotonic()
         if now - info.get("_shown", 0) > 0.2:
@@ -568,8 +719,9 @@ class App:
         try:
             data = f.finish()
         except proto.FileError as exc:
-            self.log_line("ERROR", f"File {f.name} NOT saved: {exc}")
-            self.chat_line("bad", f"✗ File {f.name} arrived damaged and was not saved ({exc})")
+            self.note("err", f"File {f.name} arrived damaged and was NOT saved ({exc}). "
+                             "Ask the sender to send it again.")
+            self.chat_center(f"✖ {f.name} arrived damaged and was not saved", bad=True)
             self.show_progress(None)
             return
         folder = self._ensure_dir()
@@ -580,41 +732,55 @@ class App:
             with open(path, "wb") as out:
                 out.write(data)
         except OSError as exc:
-            self.log_line("ERROR", f"Cannot save {path}: {exc}")
+            self.note("err", f"Cannot save {path}: {exc}")
             return
         secs = max(time.monotonic() - t0, 1e-6)
-        self.show_progress(core.receive_progress(info, 1.0, t0), done_text=f"Received {f.name} ✓")
-        self.log_line("INFO", f"File received ✓ {path} ({human_size(len(data))} in {secs:.1f} s)")
-        self.chat_line("file", f"📁 File received: {os.path.basename(path)} ({human_size(len(data))}) → {path}")
+        self.show_progress(core.receive_progress(info, 1.0, t0), done_text=f"Received {f.name}  ✔")
+        self.note("ok", f"Saved {os.path.basename(path)} — {human_size(len(data))} in {human_time(secs)} "
+                        f"({human_size(len(data) / secs)}/s), checked OK → {path}")
+        self.chat_bubble("them", f"📁 {os.path.basename(path)}  ({human_size(len(data))})  ✔ saved",
+                         tag2="file", link=(" open folder ", os.path.dirname(path)))
         self._record(stamp, "in", "file", os.path.basename(path), path)
 
     # ---- chat / log ---------------------------------------------------------
 
-    def chat_line(self, tag: str, text: str, ts: float | None = None, token: int | None = None,
-                  parts: int = 1) -> None:
-        if self.paused and tag in ("them", "me"):
+    def _append(self, widget: tk.Text, parts: list[tuple[str, tuple]]) -> None:
+        widget.configure(state="normal")
+        for text, tags in parts:
+            widget.insert("end", text, tags)
+        lines = int(widget.index("end-1c").split(".")[0])
+        if lines > MAX_LINES:
+            widget.delete("1.0", f"{lines - MAX_LINES}.0")
+        widget.configure(state="disabled")
+        if self.autoscroll_var.get():
+            self._scroll.add(widget)
+
+    def chat_bubble(self, who: str, text: str, ts: float | None = None, token: int | None = None,
+                    parts: int = 1, tag2: str | None = None, link: tuple[str, str] | None = None) -> None:
+        if self.paused:
             return
-        stamp = datetime.fromtimestamp(ts or time.time()).strftime("%H:%M:%S")
+        stamp = datetime.fromtimestamp(ts or time.time()).strftime("%H:%M")
         c = self.chat
+        tags = (who,) + ((tag2,) if tag2 else ())
         c.configure(state="normal")
-        c.insert("end", stamp + "  ", "time")
-        if tag == "me":
-            c.insert("end", "You: ", "who_me")
-        elif tag == "them":
-            c.insert("end", "Them: ", "who_them")
-        c.insert("end", text, tag)
+        c.insert("end", f"{'You' if who == 'me' else 'Them'} · {stamp}\n", (f"{who}_head", "who"))
+        c.insert("end", f"  {text}  ", tags)
+        if link:
+            self._links = getattr(self, "_links", 0) + 1
+            ltag = f"link{self._links}"
+            c.insert("end", link[0], (who, "link", ltag))
+            c.tag_bind(ltag, "<Button-1>", lambda _e, d=link[1]: open_folder(d))
         if token is not None:
             mark = f"tok{token}"
             c.mark_set(mark, "end-1c")
             c.mark_gravity(mark, "left")
             self.chat_marks[token] = {"mark": mark, "left": parts, "failed": 0}
         c.insert("end", "\n")
-        lines = int(c.index("end-1c").split(".")[0])
-        if lines > MAX_LOG_LINES:
-            c.delete("1.0", f"{lines - MAX_LOG_LINES}.0")
         c.configure(state="disabled")
-        if self.autoscroll_var.get():
-            c.see("end")
+        self._append(c, [])
+
+    def chat_center(self, text: str, bad: bool = False) -> None:
+        self._append(self.chat, [(f"{text}\n", ("center", "bad") if bad else ("center",))])
 
     def _chat_mark(self, token: int, ok: bool) -> None:
         info = self.chat_marks.get(token)
@@ -631,30 +797,28 @@ class App:
             return
         c.configure(state="normal")
         if info["failed"]:
-            c.insert(info["mark"], "  ✗ not delivered", "bad")
+            c.insert(info["mark"], " ✖ not delivered ", ("me", "bad"))
         else:
-            c.insert(info["mark"], "  ✓", "ok")
+            c.insert(info["mark"], "✔ ", ("me", "ok"))
         c.configure(state="disabled")
 
-    def log_line(self, tag: str, text: str, ts: float | None = None) -> None:
-        if self.paused and tag not in ("INFO", "ERROR"):
+    def note(self, level: str, text: str, tech: bool = False, ts: float | None = None) -> None:
+        """One line in the Log tab. tech=True lines only show with "Show technical details"."""
+        if self.paused and level in ("in", "tech"):
             return
-        stamp = datetime.fromtimestamp(ts or time.time()).strftime("%H:%M:%S.%f")[:-3]
-        self.log.configure(state="normal")
-        self.log.insert("end", stamp + "  ", "time")
-        self.log.insert("end", text + "\n", tag)
-        lines = int(self.log.index("end-1c").split(".")[0])
-        if lines > MAX_LOG_LINES:
-            self.log.delete("1.0", f"{lines - MAX_LOG_LINES}.0")
-        self.log.configure(state="disabled")
-        if self.autoscroll_var.get():
-            self.log.see("end")
+        stamp = datetime.fromtimestamp(ts or time.time()).strftime("%H:%M:%S")
+        if tech:
+            parts = [(f"{stamp}  {text}\n", ("tech",))]
+        else:
+            parts = [(f"{stamp}  ", ("time",)), (LEVEL_ICON.get(level, "·") + "  ", ("icon", level)),
+                     (text + "\n", (level,))]
+        self._append(self.log_text, parts)
 
     # ---- sending ------------------------------------------------------------
 
     def _on_mode_change(self) -> None:
         mode = self.send_mode.get()
-        self.hint.configure(text="Example:  " + SEND_HINTS[mode])
+        self.hint.configure(text=SEND_HINTS[mode])
         self.browse_btn.configure(state="normal" if mode == "Files" else "disabled")
 
     def _history_step(self, step: int) -> str:
@@ -682,14 +846,14 @@ class App:
     def send(self) -> None:
         if self.file_cancel is not None:  # files are being sent: the button means "Cancel"
             self.file_cancel.set()
-            self.log_line("INFO", "Cancelling the file transfer…")
+            self.note("warn", "Cancelling the file transfer…")
             return
         text = self.send_var.get().strip()
         mode = self.send_mode.get()
         if not text:
             return
         if not self.worker:
-            self.log_line("ERROR", "Not connected")
+            self.note("warn", "Not connected. Choose the port and click Connect first.")
             return
         w = self.worker
         stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -699,63 +863,65 @@ class App:
                 return
             if mode == "Plain text line":  # no packet, no confirmation (like typing in PuTTY)
                 w.send((text + "\r\n").encode("utf-8"))
-                self.log_line("SENT", f"→ [RAW] {text}")
-                self.chat_line("me", text)
+                self.note("out", f"Plain text sent (no confirmation): {clip(text)}")
+                self.chat_bubble("me", text)
                 self._record(stamp, "out", "raw", "", text)
             elif mode == "Number":
                 values = proto.parse_values(text)
                 token = w.new_token()
                 shown = ", ".join(f"{n} = {v:g}" for n, v in values)
-                self.chat_line("me", shown, token=token, parts=len(values))
+                self.chat_bubble("me", shown, token=token, parts=len(values))
                 for name, v in values:
-                    w.send_reliable(proto.TYPE_VALUE, proto.value_payload(name, v), f"[NUMBER] {name} = {v:g}",
+                    w.send_reliable(proto.TYPE_VALUE, proto.value_payload(name, v), f"number {name} = {v:g}",
                                     token=token)
                     self._record(stamp, "out", "value", name, f"{v:g}")
-                self.log_line("SENT", f"→ [NUMBER] {shown}")
             else:
                 if mode == "Bytes (hex)":
                     data, ftype = proto.parse_hex(text), proto.TYPE_BYTES
                     shown = f"[{len(data)} bytes] {data[:32].hex(' ')}{' …' if len(data) > 32 else ''}"
-                    kind, value = "bytes", data.hex(" ")
+                    desc, kind, value = f"bytes ({len(data)})", "bytes", data.hex(" ")
                 else:
                     data = text.encode("utf-8")
                     ftype = proto.TYPE_CMD if mode == "Command" else proto.TYPE_TEXT
-                    shown = f"[CMD] {text}" if mode == "Command" else text
+                    shown = f"[Command] {text}" if mode == "Command" else text
+                    desc = f"{'command' if mode == 'Command' else 'message'} “{clip(text)}”"
                     kind, value = ("cmd" if mode == "Command" else "text"), text
                 parts = proto.chunk(data)
                 token = w.new_token()
-                self.chat_line("me", shown, token=token, parts=len(parts))
+                self.chat_bubble("me", shown, token=token, parts=len(parts))
                 for part in parts:
-                    w.send_reliable(ftype, part, shown, token=token)
-                self.log_line("SENT", f"→ {shown}")
+                    w.send_reliable(ftype, part, desc, token=token)
                 self._record(stamp, "out", kind, "", value)
         except ValueError as exc:
-            self.log_line("ERROR", f"Not sent: {exc}")
-            self.chat_line("bad", f"Not sent: {exc}")
+            self.note("warn", f"Not sent: {exc}")
             return
         except Exception as exc:
-            self.log_line("ERROR", f"Send failed: {exc}")
+            self.note("err", f"Sending failed: {friendly_error(str(exc))}")
             return
         self._remember(text)
         self.send_var.set("")
 
     def on_delivery(self, ok: bool, desc: str, tries: int, report: bool, token: int | None) -> None:
         if desc == "hello":
-            if ok:
-                self.log_line("INFO", "The other side answered: everything you send is confirmed (✓) "
-                                      "and re-sent if lost")
-            elif not (self.worker and self.worker.peer_is_app):
-                self.log_line("ERROR", "No answer from the other side yet. STM32: is the new firmware flashed? "
-                                       "PC: is the other app connected? Air unit powered and linked?")
+            if ok and not (self.worker and self.worker.peer_is_app):
+                self.root.after(800, self._hello_stm_check)
+            elif not ok and not (self.worker and self.worker.peer_is_app):
+                self.note("warn", "No answer from the other side yet. Check: is the other app connected? "
+                                  "Same baud on both sides and in the ground unit menu? Air unit powered and linked?")
             return
         if token is not None:
             self._chat_mark(token, ok)
         if not report:
             return
         if ok:
-            self.log_line("ACKED", f"✓ delivered {desc}" + (f"  ({tries} tries)" if tries > 1 else ""))
+            self.note("out", f"Delivered {desc}" + (f" (needed {tries} tries)" if tries > 1 else ""))
         else:
-            self.log_line("ERROR", f"✗ NOT delivered {desc}  (no answer after {tries} tries)")
+            self.note("err", f"NOT delivered: {desc} — no answer after {tries} tries. Is the link still up?")
+
+    def _hello_stm_check(self) -> None:
+        w = self.worker
+        if w and w.hello_ok and not w.peer_is_app:
+            self.note("ok", "An STM32 answered — commands and messages you send are confirmed.")
 
     # ---- sending files ------------------------------------------------------
 
@@ -763,7 +929,7 @@ class App:
         paths = [p for p in paths if p]
         missing = [p for p in paths if not os.path.isfile(p)]
         if missing or not paths:
-            self.log_line("ERROR", f"File not found: {missing[0] if missing else '(none)'} — use Browse…")
+            self.note("warn", f"File not found: {missing[0] if missing else '(none)'} — use Browse…")
             return
         total = sum(os.path.getsize(p) for p in paths)
         bps = int(self.baud_var.get()) / 10 * 0.7  # rough, before compression
@@ -776,38 +942,42 @@ class App:
             self._remember(p)
         worker = self.worker
         cancel = self.file_cancel = threading.Event()
-        self.send_btn.configure(text="Cancel")
-        self.log_line("SENT", f"→ sending {len(paths)} file(s), {human_size(total)}")
+        self.send_btn.configure(text="Cancel", style="Danger.TButton")
+        if len(paths) > 1:
+            self.note("out", f"Sending {len(paths)} files ({human_size(total)}) one after another…")
         threading.Thread(target=core.send_files,
-                         args=(worker, paths, self.events, cancel, lambda: worker is self.worker and not
-                               worker.stopped), daemon=True).start()
+                         args=(worker, paths, self.events, cancel,
+                               lambda: worker is self.worker and not worker.stopped), daemon=True).start()
         self.send_var.set("")
         self.file_paths = []
 
     def on_file_begin(self, info: dict) -> None:
-        extra = (f", compressed {human_size(info['size'])} → {human_size(info['sent_size'])}"
-                 if info["compressed"] else "")
-        self.log_line("SENT", f"→ [FILE {info['index']}/{info['count']}] {info['name']} "
-                              f"({human_size(info['size'])}{extra})")
-        info["token"] = token = self.worker.new_token() if self.worker else None
+        extra = (f", compressed to {human_size(info['sent_size'])} for the radio" if info["compressed"] else "")
+        count = f" ({info['index']}/{info['count']})" if info["count"] > 1 else ""
+        self.note("out", f"Sending file {info['name']}{count} — {human_size(info['size'])}{extra}…")
+        token = self.worker.new_token() if self.worker else None
         self._file_token = token
-        self.chat_line("me", f"📎 {info['name']} ({human_size(info['size'])}{' · compressed' if info['compressed'] else ''})",
-                       token=token)
+        self.chat_bubble("me", f"📎 {info['name']}  ({human_size(info['size'])})", token=token, tag2="file")
         self.show_progress({**info, "dir": "send", "frac": 0.0, "speed": 0.0, "eta": math.inf})
 
     def on_file_sent(self, info: dict) -> None:
-        token = getattr(self, "_file_token", None)
+        token = self._file_token
         if info.get("ok"):
-            self.log_line("ACKED", f"✓ file delivered {info['name']}: {human_size(info['size'])} in "
-                                   f"{info['secs']:.1f} s ({human_size(info['speed'])}/s)")
+            self.note("ok", f"Sent {info['name']} — {human_size(info['size'])} in {human_time(info['secs'])} "
+                            f"({human_size(info['speed'])}/s). The other side confirmed every piece.")
             if token is not None:
                 self._chat_mark(token, True)
             self.show_progress({**info, "dir": "send", "frac": 1.0, "speed": info["speed"], "eta": 0},
-                               done_text=f"Sent {info['name']} ✓")
+                               done_text=f"Sent {info['name']}  ✔")
             self._record(datetime.now().strftime("%H:%M:%S.%f")[:-3], "out", "file", info["name"],
                          info.get("path", ""))
+        elif info.get("cancelled"):
+            self.note("warn", f"Sending {info['name']} was cancelled.")
+            if token is not None:
+                self._chat_mark(token, False)
+            self.show_progress(None)
         else:
-            self.log_line("ERROR", f"✗ file {info['name']}: {info.get('error', 'failed')}")
+            self.note("err", f"File {info['name']} was NOT delivered: {info.get('error', 'failed')}")
             if token is not None:
                 self._chat_mark(token, False)
             self.show_progress(None)
@@ -825,9 +995,9 @@ class App:
         count = f" ({p['index']}/{p['count']})" if p.get("count", 1) > 1 else ""
         speed = f"{human_size(p['speed'])}/s" if p["speed"] > 0 else "…"
         left = human_time(p["eta"]) + " left" if math.isfinite(p["eta"]) else "…"
-        self.progress_lbl.configure(text=f"{arrow} {p['name']}{count}  {p['frac'] * 100:.0f}% · {speed} · {left}")
+        self.progress_lbl.configure(text=f"{arrow} {p['name']}{count}   {p['frac'] * 100:.0f}%  ·  {speed}  ·  {left}")
 
-    # ---- table / graph ------------------------------------------------------
+    # ---- status / table / graph ---------------------------------------------
 
     def on_table_click(self, event) -> None:
         name = self.table.identify_row(event.y)
@@ -835,13 +1005,17 @@ class App:
             s = self.series[name]
             s.plot = not s.plot
 
+    def _set_badge(self, text: str, color: str) -> None:
+        if self.badge.cget("text") != text:
+            self.badge.configure(text=text, bg=color)
+
     def update_status(self) -> None:
         now = time.monotonic()
         for name, s in self.series.items():
             if not s.points:
                 continue
             t, v = s.points[-1]
-            vals = ("■ on" if s.plot else "off", f"{v:.4g}", f"{s.vmin:.4g}", f"{s.vmax:.4g}", s.count,
+            vals = ("● on" if s.plot else "off", f"{v:.4g}", f"{s.vmin:.4g}", f"{s.vmax:.4g}", s.count,
                     f"{now - t:.1f}")
             if self.table.exists(name):
                 self.table.item(name, values=vals)
@@ -855,27 +1029,33 @@ class App:
         self.rate_hist.append((now, st.frames))
         while self.rate_hist and now - self.rate_hist[0][0] > 3:
             self.rate_hist.popleft()
-        rate = 0.0
-        if len(self.rate_hist) > 1:
-            (t0, f0), (t1, f1) = self.rate_hist[0], self.rate_hist[-1]
-            rate = (f1 - f0) / max(t1 - t0, 1e-6)
 
-        who = "app" if w and w.peer_is_app else "STM32" if w and w.hello_ok else ""
         if not w:
-            self.link_lbl.configure(text="●  disconnected", fg="#888")
+            if self.lost_connection:
+                self._set_badge("✖ Connection lost", C["err"])
+            else:
+                self._set_badge("● Disconnected", "#64748b")
+        elif w.peer_is_app:
+            self._set_badge("● Connected to the other app", C["ok"])
+        elif w.hello_ok:
+            self._set_badge("● Connected to STM32", C["ok"])
         elif self.last_rx and now - self.last_rx < 2:
-            self.link_lbl.configure(text=f"●  receiving{' from ' + who if who else ''}", fg="#30a46c")
+            self._set_badge("● Receiving data", C["ok"])
         else:
-            self.link_lbl.configure(text="●  connected, no data", fg="#f5a524")
+            self._set_badge("● Waiting for the other side…", C["warn"])
 
-        total = st.frames + st.crc_errors + st.lost
-        quality = f"{100 * st.frames / total:.1f}%" if total else "–"
-        rtt = f"  delay {w.srtt * 1000:.0f} ms" if w and w.srtt else ""
+        self._watch_quality(now, st)
+
+        if w and w.peer_is_app:  # app to app: quality = share of packets that needed no re-send
+            quality = f"{100 * tx.sent / (tx.sent + tx.retries):.0f}%" if tx.sent else "–"
+        else:
+            total = st.frames + st.crc_errors + st.lost
+            quality = f"{100 * st.frames / total:.0f}%" if total else "–"
+        delay = f"{w.srtt * 1000:.0f} ms" if w and w.srtt else "–"
         self.status.configure(
-            text=f"IN  ok {st.frames}  damaged {st.crc_errors}  lost {st.lost}  quality {quality}  "
-                 f"{rate:.1f} pkt/s      OUT  sent {tx.sent}  confirmed {tx.delivered}  re-sent {tx.retries}  "
-                 f"failed {tx.failed}{rtt}"
-        )
+            text=f"Link quality {quality}   ·   delay {delay}   ·   received {st.frames} packets "
+                 f"({st.crc_errors} damaged, {st.lost} lost)   ·   sent {tx.sent}, confirmed {tx.delivered}, "
+                 f"re-sent {tx.retries}, failed {tx.failed}")
         if self.session_file:
             try:
                 self.session_file.flush()
@@ -883,13 +1063,40 @@ class App:
                 pass
         self.root.after(500, self.update_status)
 
+    def _watch_quality(self, now: float, st: proto.ParserStats) -> None:
+        """Explain problems in plain words, at most every 10 s."""
+        if self.noise_bytes and now - self._noise_reported > 10:
+            self._noise_reported = now
+            self.note("warn", f"Radio noise: {self.noise_bytes:,} unreadable bytes were ignored. If this keeps "
+                              "happening: same baud on both sides and in the ground unit menu? Only ONE device "
+                              "connected to the air unit UART? GND wire connected?")
+            self.noise_bytes = 0
+        tx = self.worker.tx if self.worker else core.TxStats()
+        mark = (now, st.frames, st.crc_errors, st.lost, tx.sent, tx.retries)
+        if self._quality_mark is None:
+            self._quality_mark = mark
+            return
+        t0, f0, d0, l0, s0, r0 = self._quality_mark
+        if now - t0 < 10:
+            return
+        self._quality_mark = mark
+        frames, damaged, lost = st.frames - f0, st.crc_errors - d0, st.lost - l0
+        sent, resent = tx.sent - s0, tx.retries - r0
+        bad = damaged + lost
+        if bad >= 5 and bad > 0.1 * (frames + bad):
+            self.note("warn", f"Weak or noisy link: {damaged} damaged and {lost} lost packets in the last 10 s. "
+                              "Try moving the units or the antennas.")
+        elif resent >= 5 and resent > 0.25 * max(sent, 1):
+            self.note("warn", f"Weak link: {resent} packets had to be re-sent in the last 10 s (they still arrive, "
+                              "just slower). Try moving the units or the antennas.")
+
     def redraw_plot(self) -> None:
         c = self.canvas
         c.delete("all")
         w, h = c.winfo_width(), c.winfo_height()
         if w > 50 and h > 50:
             self._draw_plot(c, w, h)
-        self.root.after(100, self.redraw_plot)
+        self.root.after(150, self.redraw_plot)
 
     def _draw_plot(self, c: tk.Canvas, w: int, h: int) -> None:
         span = {"10 s": 10, "30 s": 30, "60 s": 60, "5 min": 300}.get(self.window_var.get(), 30)
@@ -897,12 +1104,11 @@ class App:
         t_start = now - span
         visible = {n: [(t, v) for t, v in s.points if t >= t_start] for n, s in self.series.items() if s.plot}
         visible = {n: p for n, p in visible.items() if p}
-        left, right, top, bottom = 60, 12, 12, 26
+        left, right, top, bottom = 60, 12, 26, 24
         pw, ph = w - left - right, h - top - bottom
-        c.create_rectangle(left, top, left + pw, top + ph, outline="#333")
         if not visible:
-            c.create_text(w / 2, h / 2, text="No values yet — numbers sent by the other side appear here",
-                          fill="#666", font=("Segoe UI", 10))
+            c.create_text(w / 2, h / 2, text="No numbers yet — values sent by the other side appear here",
+                          fill="#9ca3af", font=("Segoe UI", 10))
             return
         lo = min(v for p in visible.values() for _, v in p)
         hi = max(v for p in visible.values() for _, v in p)
@@ -910,39 +1116,42 @@ class App:
             lo, hi = lo - 1, hi + 1
         pad = (hi - lo) * 0.08
         lo, hi = lo - pad, hi + pad
-        for i in range(5):  # y grid
+        for i in range(5):
             y = top + ph * i / 4
-            val = hi - (hi - lo) * i / 4
-            c.create_line(left, y, left + pw, y, fill="#262626")
-            c.create_text(left - 6, y, text=f"{val:.4g}", anchor="e", fill="#888", font=("Segoe UI", 8))
-        for i in range(6):  # x grid
+            c.create_line(left, y, left + pw, y, fill=C["grid"])
+            c.create_text(left - 8, y, text=f"{hi - (hi - lo) * i / 4:.4g}", anchor="e", fill=C["muted"],
+                          font=("Segoe UI", 8))
+        for i in range(6):
             x = left + pw * i / 5
-            c.create_line(x, top, x, top + ph, fill="#262626")
+            c.create_line(x, top, x, top + ph, fill=C["grid"])
             c.create_text(x, top + ph + 12, text=f"-{span * (5 - i) / 5:.0f}s" if i < 5 else "now",
-                          fill="#888", font=("Segoe UI", 8))
-        lx = left + 8
+                          fill=C["muted"], font=("Segoe UI", 8))
+        lx = left
         for name, pts in visible.items():
             s = self.series[name]
-            step = max(1, len(pts) // pw)  # at most ~1 point per pixel
+            step = max(1, len(pts) // pw)
             coords = []
             for t, v in pts[::step]:
                 coords += [left + pw * (t - t_start) / span, top + ph * (hi - v) / (hi - lo)]
             if len(coords) >= 4:
-                c.create_line(*coords, fill=s.color, width=2)
+                c.create_line(*coords, fill=s.color, width=2, smooth=False)
             else:
-                c.create_oval(coords[0] - 2, coords[1] - 2, coords[0] + 2, coords[1] + 2, fill=s.color, outline="")
-            label = f"{name} {pts[-1][1]:.4g}"
-            c.create_text(lx, top + 10, text=label, anchor="w", fill=s.color, font=("Segoe UI", 9, "bold"))
-            lx += 14 + 8 * len(label)
+                c.create_oval(coords[0] - 3, coords[1] - 3, coords[0] + 3, coords[1] + 3, fill=s.color, outline="")
+            label = f"{name}  {pts[-1][1]:.4g}"
+            c.create_oval(lx, 8, lx + 9, 17, fill=s.color, outline="")
+            c.create_text(lx + 14, 12, text=label, anchor="w", fill=C["text"], font=("Segoe UI", 9, "bold"))
+            lx += 34 + 7 * len(label)
 
     # ---- misc ---------------------------------------------------------------
 
     def toggle_pause(self) -> None:
         self.paused = not self.paused
         self.pause_btn.configure(text="Resume" if self.paused else "Pause")
+        self.note("info", "Paused: new messages are not shown (they are still received and saved)."
+                  if self.paused else "Resumed.")
 
     def clear_all(self) -> None:
-        for widget in (self.log, self.chat):
+        for widget in (self.log_text, self.chat):
             widget.configure(state="normal")
             widget.delete("1.0", "end")
             widget.configure(state="disabled")
@@ -950,11 +1159,13 @@ class App:
         self.series.clear()
         self.table.delete(*self.table.get_children())
         self.csv_rows.clear()
-        self.rx_bytes = 0
         self.rate_hist.clear()
-        if self.worker:  # start the IN / OUT counters from zero too
+        self.noise_bytes = 0
+        self._quality_mark = None
+        if self.worker:  # start the counters from zero too
             self.worker.parser.stats = proto.ParserStats()
             self.worker.tx = core.TxStats()
+        self.note("info", "Cleared.")
 
     def save_csv(self) -> None:
         if not self.csv_rows:
@@ -969,7 +1180,7 @@ class App:
             wr = csv.writer(f)
             wr.writerow(["time", "direction", "kind", "name", "value"])
             wr.writerows(self.csv_rows)
-        self.log_line("INFO", f"Saved {len(self.csv_rows)} rows to {path}")
+        self.note("ok", f"Saved {len(self.csv_rows)} rows to {path}")
 
 
 def main() -> None:

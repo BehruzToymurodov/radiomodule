@@ -207,6 +207,9 @@ class Parser:
 
     def __init__(self) -> None:
         self.stats = ParserStats()
+        # Counting gaps in seq as "lost" only makes sense for a steady stream (STM32).
+        # Another app re-sends and skips numbers on purpose, so the link turns this off.
+        self.count_lost = True
         self._state = self._WAIT_SYNC1
         self._body = bytearray()
         self._need = 0
@@ -281,7 +284,7 @@ class Parser:
                     self.stats.crc_errors += 1
                     return
                 ftype, seq = self._body[0], self._body[1]
-                if self._last_seq is not None:
+                if self._last_seq is not None and self.count_lost:
                     gap = (seq - self._last_seq - 1) & 0xFF
                     if gap < 128:  # ignore huge jumps (e.g. STM32 reset)
                         self.stats.lost += gap

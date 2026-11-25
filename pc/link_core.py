@@ -142,6 +142,8 @@ class LinkWorker(threading.Thread):
             self._seen.clear()             # new session: its sequence numbers start over
             first = not self.peer_is_app
             self.peer_is_app = True
+            self.parser.count_lost = False   # see Parser.count_lost
+            self.parser.stats.lost = 0
             if please:
                 self.send_reliable(proto.TYPE_HELLO, proto.hello_payload(False, self.session), "hello",
                                    report=False)

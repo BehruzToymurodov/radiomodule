@@ -31,7 +31,9 @@ The app needs all three files in `pc/`: `hm30_link_app.py`, `protocol.py`, `link
 
 What it does:
 
-- **Chat** tab (messages, ✓ when the other side confirmed) and **Log** tab (technical details)
+- **Chat** tab (message bubbles, ✔ when the other side confirmed, "open folder" on received files)
+- **Log** tab in plain words (✔ done, ⚠ warning, ✖ problem); tick *Show technical details* for packet-level info.
+  Radio noise is counted and explained once instead of filling the screen.
 - **Values** table and live **graph** for numbers the other side sends
 - **Send**: Text, Command, Number (`speed=1.5, angle=-30`), Bytes (hex), Files, Plain text line
 - **Files**: pick several at once; progress bar with speed and time left; text-like files are
