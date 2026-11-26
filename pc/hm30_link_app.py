@@ -1579,18 +1579,22 @@ class App:
             self._quality_mark = mark
             return
         t0, f0, d0, l0, s0, r0 = self._quality_mark
-        if now - t0 < 10:
+        if now - t0 < 60:  # judge the link over a whole minute, and say it at most once a minute
             return
         self._quality_mark = mark
+        w = self.worker
+        if not w or not (w.peer_is_app or w.hello_ok):  # still connecting: hello retries are not "weak"
+            return
         frames, damaged, lost = st.frames - f0, st.crc_errors - d0, st.lost - l0
         sent, resent = tx.sent - s0, tx.retries - r0
         bad = damaged + lost
-        if bad >= 5 and bad > 0.1 * (frames + bad):
-            self.note("warn", f"Weak or noisy link: {damaged} damaged and {lost} lost packets in the last 10 s. "
-                              "Try moving the units or the antennas.")
-        elif resent >= 5 and resent > 0.25 * max(sent, 1):
-            self.note("warn", f"Weak link: {resent} packets had to be re-sent in the last 10 s (they still arrive, "
-                              "just slower). Try moving the units or the antennas.")
+        if bad >= 10 and bad > 0.1 * (frames + bad):
+            self.note("warn", f"Noisy link: {damaged} damaged and {lost} lost packets in the last minute. "
+                              "Check the antennas and the distance.")
+        elif resent >= 20 and resent > 0.3 * max(sent, 1):
+            self.note("warn", f"Weak link: {100 * resent // max(sent + resent, 1)}% of packets needed re-sending "
+                              "in the last minute (everything still arrives, just slower). The app has slowed "
+                              "down to match the radio. Moving the units or antennas can help.")
 
     # The graph keeps its drawn items and only moves them (Canvas.coords) instead of deleting and
     # re-creating everything; the grid is rebuilt only when the size or time window changes, and the

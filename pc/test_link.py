@@ -163,6 +163,38 @@ class RestartTest(PairTest):
         self.assertEqual(self.a.tx.failed, 0)
 
 
+class SlowRadioTest(unittest.TestCase):
+    """The real HM30 failure: the radio is slower than the UART and drops what does not fit in its
+    small buffer. Without congestion control this collapsed into re-sends, and 8-bit sequence numbers
+    wrapping around made the receiver throw away new pieces as "copies"."""
+
+    def test_file_over_slow_radio_with_tiny_buffer(self):
+        a, b = core.make_pair(baud=115200, delay=0.15, loss=0.01, air_bps=1500, buffer=600)
+        ea, eb = queue.Queue(), queue.Queue()
+        A, B = core.LinkWorker(a, ea), core.LinkWorker(b, eb)
+        A.start()
+        B.start()
+        rx = Receiver(eb)
+        try:
+            self.assertTrue(wait_for(lambda: A.peer_is_app and B.peer_is_app, 10))
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "photo.jpg")
+                data = os.urandom(25_000)
+                with open(path, "wb") as f:
+                    f.write(data)
+                events, cancel = queue.Queue(), threading.Event()
+                core.send_files(A, [path], events, cancel, lambda: True)
+                result = [e[1] for e in list(events.queue) if e[0] == "file_sent"][0]
+                self.assertTrue(result["ok"], result)
+                self.assertTrue(wait_for(lambda: "photo.jpg" in rx.files, 5))
+                self.assertEqual(rx.files["photo.jpg"], data)
+                self.assertLess(A.tx.retries, 0.35 * A.tx.sent, "too many re-sends: congestion control not working")
+        finally:
+            A.stop()
+            B.stop()
+            rx.stop()
+
+
 class StmCompatibilityTest(unittest.TestCase):
     def test_stm32_values_are_not_acked_or_filtered(self):
         """An STM32 never sends HELLO: its packets must pass through untouched (even repeated seq)."""

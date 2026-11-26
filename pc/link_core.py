@@ -42,6 +42,7 @@ class Pending:
     first: float
     tries: int = 1
     last: float = 0.0
+    max_tries: int = 6    # file pieces get many more tries: they only fail when the link is gone
 
 
 @dataclass
@@ -61,8 +62,12 @@ class LinkWorker(threading.Thread):
     """
 
     MAX_TRIES = 6
-    MIN_RTO, MAX_RTO = 0.4, 4.0   # re-send timeout limits (s); adapts to the measured delay
+    MIN_RTO, MAX_RTO = 0.4, 6.0   # re-send timeout limits (s); adapts to the measured delay
     DRAIN_S = 0.6                 # on connect, drop data the ground unit buffered earlier
+    # Congestion control (like TCP): the radio is slower than the UART and drops what does not fit
+    # in its small buffer. So we start with few packets in flight, add more while everything is
+    # confirmed, and halve at the first loss. The sender settles at what the radio can carry.
+    CWND_START, CWND_MAX = 2.0, 24.0
 
     def __init__(self, port, events: queue.Queue) -> None:
         super().__init__(daemon=True)
@@ -75,12 +80,16 @@ class LinkWorker(threading.Thread):
         self.session = random.getrandbits(32)   # tells the other side "this is a new connection"
         self.hello_ok = False
         self.srtt: float | None = None  # smoothed round-trip time (s)
+        self.rttvar = 0.0               # how much the round-trip time jumps around
+        self.cwnd = self.CWND_START     # packets allowed in flight (congestion window)
+        self.ssthresh = self.CWND_MAX / 2
+        self._last_cut = 0.0
         self._stop = threading.Event()
         self._tx_lock = threading.Lock()
         self._tx_seq = random.randrange(256)
         self._pending: dict[int, Pending] = {}
         self._plock = threading.Lock()
-        self._seen: set[int] = set()
+        self._seen: dict[int, tuple[int, int]] = {}  # seq -> (type, crc of payload) recently accepted
         self._tokens = itertools.count(1)
 
     # ---- thread ---------------------------------------------------------------
@@ -151,10 +160,14 @@ class LinkWorker(threading.Thread):
             return False
         if self.peer_is_app and it.ftype in APP_ACKED:
             self._send_ack(it)
-            if it.seq in self._seen:      # a re-sent copy: our ACK got lost on the way back
+            # A re-sent copy (our ACK got lost) has the same seq AND the same content. seq is only
+            # 8 bits and wraps, so the content check stops a NEW packet that reuses an old number
+            # from being thrown away as a "copy".
+            key = (it.ftype, proto.crc16(it.payload))
+            if self._seen.get(it.seq) == key:
                 return False
-            self._seen.add(it.seq)
-            self._seen.discard((it.seq + 128) & 0xFF)
+            self._seen[it.seq] = key
+            self._seen.pop((it.seq + 128) & 0xFF, None)
         return True
 
     def _send_ack(self, frame: proto.Frame) -> None:
@@ -176,7 +189,16 @@ class LinkWorker(threading.Thread):
             self.tx.delivered += 1
             if p.tries == 1:  # only clean samples (Karn's rule)
                 rtt = now - p.first
-                self.srtt = rtt if self.srtt is None else 0.8 * self.srtt + 0.2 * rtt
+                if self.srtt is None:
+                    self.srtt, self.rttvar = rtt, rtt / 2
+                else:
+                    self.rttvar = 0.75 * self.rttvar + 0.25 * abs(self.srtt - rtt)
+                    self.srtt = 0.875 * self.srtt + 0.125 * rtt
+            # congestion window grows while things get through: fast at first, then slowly
+            if self.cwnd < self.ssthresh:
+                self.cwnd = min(self.CWND_MAX, self.cwnd + 1)
+            else:
+                self.cwnd = min(self.CWND_MAX, self.cwnd + 1 / self.cwnd)
         if p.desc == "hello":
             self.hello_ok = True
         if p.group is not None:
@@ -205,13 +227,15 @@ class LinkWorker(threading.Thread):
             self.port.write(data)
 
     def send_reliable(self, ftype: int, payload: bytes, desc: str, report: bool = True,
-                      group: dict | None = None, token: int | None = None, size: int = 0) -> int:
+                      group: dict | None = None, token: int | None = None, size: int = 0,
+                      max_tries: int | None = None) -> int:
         """Send a packet and keep re-sending it until it is ACKed. Returns its seq."""
         now = time.monotonic()
         with self._plock:
             seq = self._next_seq()
             frame = proto.encode(ftype, payload, seq)
-            self._pending[seq] = Pending(seq, ftype, frame, desc, report, group, token, now, 1, now)
+            self._pending[seq] = Pending(seq, ftype, frame, desc, report, group, token, now, 1, now,
+                                         max_tries or self.MAX_TRIES)
             if group is not None and size:
                 group.setdefault("size", {})[seq] = size
             self.tx.sent += 1
@@ -223,8 +247,14 @@ class LinkWorker(threading.Thread):
             return len(self._pending)
 
     @property
+    def window(self) -> int:
+        """How many packets may wait for an ACK at once right now."""
+        return max(1, int(self.cwnd))
+
+    @property
     def rto(self) -> float:
-        base = 0.5 if self.srtt is None else 3 * self.srtt
+        """Re-send timeout: measured round trip plus 4x its jitter (like TCP)."""
+        base = 1.0 if self.srtt is None else self.srtt + 4 * self.rttvar
         return min(self.MAX_RTO, max(self.MIN_RTO, base))
 
     def _retry(self, now: float) -> None:
@@ -232,9 +262,9 @@ class LinkWorker(threading.Thread):
         resend, failed = [], []
         with self._plock:
             for p in list(self._pending.values()):
-                if now - p.last < rto * (1.5 ** (p.tries - 1)):  # back off a little each try
+                if now - p.last < min(rto * (1.5 ** (p.tries - 1)), self.MAX_RTO):  # back off each try
                     continue
-                if p.tries >= self.MAX_TRIES:
+                if p.tries >= p.max_tries:
                     del self._pending[p.seq]
                     self.tx.failed += 1
                     failed.append(p)
@@ -243,6 +273,11 @@ class LinkWorker(threading.Thread):
                     p.last = now
                     self.tx.retries += 1
                     resend.append(p.frame)
+            if resend and now - self._last_cut > max(rto, 0.3):
+                # a loss: the radio is full -> halve the window (at most once per round trip)
+                self._last_cut = now
+                self.ssthresh = max(self.cwnd / 2, 2.0)
+                self.cwnd = max(1.0, self.cwnd / 2)
         for frame in resend:
             self.send(frame)
         for p in failed:
@@ -282,10 +317,19 @@ def send_files(worker: LinkWorker, paths: list[str], events: queue.Queue, cancel
     events.put(("files_done",))
 
 
-def _wait(group: dict, want: int, cancel: threading.Event, is_current, timeout: float) -> bool:
-    end = time.monotonic() + timeout
+FILE_TRIES = 40      # a file piece is re-sent up to 40 times (with back-off) before it counts as lost
+FILE_STALL_S = 60.0  # a file only fails if NOTHING got through for this long
+
+
+def _wait(group: dict, want: int, cancel: threading.Event, is_current, stall: float) -> bool:
+    """Wait until `want` packets of the group are answered; give up only after `stall` s without progress."""
+    last, last_change = -1, time.monotonic()
     while group["ok"] + group["failed"] < want:
-        if cancel.is_set() or not is_current() or time.monotonic() > end:
+        if cancel.is_set() or not is_current():
+            return False
+        if group["ok"] != last:
+            last, last_change = group["ok"], time.monotonic()
+        elif time.monotonic() - last_change > stall:
             return False
         time.sleep(0.01)
     return group["failed"] == 0
@@ -293,40 +337,44 @@ def _wait(group: dict, want: int, cancel: threading.Event, is_current, timeout: 
 
 def _send_one(worker, fid, out: proto.OutgoingFile, info, events, cancel, is_current) -> dict:
     t0 = time.monotonic()
-    budget = worker.MAX_RTO * worker.MAX_TRIES * 2
     start = {"ok": 0, "failed": 0}
     worker.send_reliable(proto.TYPE_FILE_START, proto.file_start_payload(fid, out), "file start",
-                         report=False, group=start)
-    if not _wait(start, 1, cancel, is_current, budget):
+                         report=False, group=start, max_tries=FILE_TRIES)
+    if not _wait(start, 1, cancel, is_current, FILE_STALL_S):
         return {"ok": False, "cancelled": cancel.is_set(),
                 "error": "the receiver did not answer (is its app running and connected?)"}
 
     pieces = proto.file_pieces(out.body)
     group = {"ok": 0, "failed": 0}
-    window = 16 if worker.peer_is_app else 4  # an STM32 can only queue 8 packets
-    last_report = 0.0
+    cap = 24 if worker.peer_is_app else 4  # an STM32 can only queue 8 packets
+    last_report, last_ok, last_change = 0.0, -1, time.monotonic()
     for i, (offset, data) in enumerate(pieces):
-        while worker.pending_count() >= window:
+        while worker.pending_count() >= min(worker.window, cap):  # adaptive: what the radio can carry
             if cancel.is_set() or not is_current():
                 return {"ok": False, "cancelled": cancel.is_set(), "error": "cancelled"}
             if group["failed"]:
-                return {"ok": False, "error": f"{group['failed']} pieces were not delivered (link too weak?)"}
+                return {"ok": False, "error": f"{group['failed']} pieces were not delivered (the link was lost)"}
+            if group["ok"] != last_ok:
+                last_ok, last_change = group["ok"], time.monotonic()
+            elif time.monotonic() - last_change > FILE_STALL_S:
+                return {"ok": False, "error": f"nothing got through for {FILE_STALL_S:.0f} s (the link was lost)"}
             time.sleep(0.005)
         if cancel.is_set() or not is_current():
             return {"ok": False, "cancelled": cancel.is_set(), "error": "cancelled"}
         worker.send_reliable(proto.TYPE_FILE_DATA, proto.file_data_payload(fid, offset, data), "file piece",
-                             report=False, group=group, size=len(data))
+                             report=False, group=group, size=len(data), max_tries=FILE_TRIES)
         now = time.monotonic()
         if now - last_report > 0.2:
             last_report = now
             events.put(("progress", _progress("send", info, group.get("ok_bytes", 0), len(out.body), t0)))
-    if not _wait(group, len(pieces), cancel, is_current, budget):
+    if not _wait(group, len(pieces), cancel, is_current, FILE_STALL_S):
         if cancel.is_set():
             return {"ok": False, "cancelled": True, "error": "cancelled"}
-        return {"ok": False, "error": f"{group['failed']} of {len(pieces)} pieces were not delivered"}
+        return {"ok": False, "error": f"{len(pieces) - group['ok']} of {len(pieces)} pieces were not delivered"}
     end = {"ok": 0, "failed": 0}
-    worker.send_reliable(proto.TYPE_FILE_END, bytes((fid,)), "file end", report=False, group=end)
-    if not _wait(end, 1, cancel, is_current, budget):
+    worker.send_reliable(proto.TYPE_FILE_END, bytes((fid,)), "file end", report=False, group=end,
+                         max_tries=FILE_TRIES)
+    if not _wait(end, 1, cancel, is_current, FILE_STALL_S):
         return {"ok": False, "cancelled": cancel.is_set(), "error": "end of file not confirmed"}
     secs = max(time.monotonic() - t0, 1e-6)
     events.put(("progress", _progress("send", info, len(out.body), len(out.body), t0)))
@@ -440,20 +488,34 @@ class DemoSerial:
 
 
 class _Radio:
-    """One direction of the simulated radio: limited speed, delay and packet loss."""
+    """One direction of the simulated link: the UART (bytes_per_s), then optionally a slower radio
+    (air_bps) with a small buffer that drops what does not fit (like the HM30 datalink), plus delay
+    and random packet loss."""
 
-    def __init__(self, bytes_per_s: float, delay: float, loss: float) -> None:
+    def __init__(self, bytes_per_s: float, delay: float, loss: float,
+                 air_bps: float | None = None, buffer: int | None = None) -> None:
         self.bps, self.delay, self.loss = bytes_per_s, delay, loss
+        self.air_bps, self.buffer = air_bps, buffer
         self.items: deque[tuple[float, bytes]] = deque()
         self.cv = threading.Condition()
-        self.busy_until = 0.0
+        self.busy_until = 0.0  # UART
+        self.air_until = 0.0   # radio
+        self.dropped = 0
 
     def put(self, data: bytes) -> None:
         with self.cv:
             now = time.monotonic()
             self.busy_until = max(now, self.busy_until) + len(data) / self.bps
+            arrive = self.busy_until
+            if self.air_bps:
+                backlog = max(0.0, self.air_until - arrive) * self.air_bps
+                if self.buffer is not None and backlog + len(data) > self.buffer:
+                    self.dropped += 1  # radio buffer full: the packet is silently lost
+                    return
+                self.air_until = max(arrive, self.air_until) + len(data) / self.air_bps
+                arrive = self.air_until
             if random.random() >= self.loss:
-                self.items.append((self.busy_until + self.delay, data))
+                self.items.append((arrive + self.delay, data))
                 self.cv.notify()
 
     def get(self, timeout: float) -> bytes:
@@ -490,8 +552,10 @@ class PairPort:
         self.is_open = False
 
 
-def make_pair(baud: int = 115200, delay: float = 0.06, loss: float = 0.05) -> tuple[PairPort, PairPort]:
-    """Two ports joined by a simulated radio: `loss` of packets lost in each direction."""
-    a_to_b = _Radio(baud / 10, delay, loss)
-    b_to_a = _Radio(baud / 10, delay, loss)
+def make_pair(baud: int = 115200, delay: float = 0.06, loss: float = 0.05,
+              air_bps: float | None = None, buffer: int | None = None) -> tuple[PairPort, PairPort]:
+    """Two ports joined by a simulated radio: `loss` of packets lost in each direction.
+    air_bps/buffer: a radio slower than the UART with a small drop-when-full buffer."""
+    a_to_b = _Radio(baud / 10, delay, loss, air_bps, buffer)
+    b_to_a = _Radio(baud / 10, delay, loss, air_bps, buffer)
     return PairPort(a_to_b, b_to_a), PairPort(b_to_a, a_to_b)
