@@ -167,6 +167,23 @@ def set_icon(window) -> None:
         pass
 
 
+def bluetooth_name(hwid: str) -> str | None:
+    """Name of the paired Bluetooth device behind a Bluetooth COM port (e.g. "SIYI-6A12…"), Windows only."""
+    import re
+    m = re.search(r"&([0-9A-F]{12})_", (hwid or "").upper())
+    if not m or not sys.platform.startswith("win"):
+        return None
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                             r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\\" + m.group(1).lower())
+        raw, _ = winreg.QueryValueEx(key, "Name")
+        name = bytes(raw).split(b"\x00")[0].decode("utf-8", errors="replace").strip()
+        return name or None
+    except OSError:
+        return None
+
+
 def open_file(path: str) -> None:
     if sys.platform.startswith("win"):
         os.startfile(path)  # type: ignore[attr-defined]
@@ -713,16 +730,26 @@ class App:
     # ---- connection ---------------------------------------------------------
 
     def refresh_ports(self, select: str | None = None) -> None:
-        items, best = [], None
+        items, best, bt = [], None, []
         if serial is not None:
             for p in sorted(serial.tools.list_ports.comports(), key=lambda p: p.device):
                 is_hm30 = p.vid == HM30_VID and p.pid == HM30_PID
-                label = f"{p.device} — {'HM30 ground unit' if is_hm30 else (p.description or 'serial port')}"
-                if "bluetooth" in label.lower():
-                    continue  # Bluetooth COM ports are never the HM30 link
+                desc = p.description or "serial port"
+                if "bluetooth" in desc.lower() or "bthenum" in (p.hwid or "").lower():
+                    # the HM30 ground unit in "Bluetooth" datalink mode shows up as one of these
+                    name = bluetooth_name(p.hwid) or "unknown device"
+                    label = f"{p.device} — Bluetooth: {name}"
+                    if name.upper().startswith("SIYI"):  # the ground unit: list it first, suggest it
+                        bt.insert(0, label)
+                        best = best or label
+                    else:
+                        bt.append(label)
+                    continue
+                label = f"{p.device} — {'HM30 ground unit' if is_hm30 else desc}"
                 items.append(label)
                 if best is None and (is_hm30 or p.vid is not None):
                     best = label
+        items += bt  # after the USB ports
         if self.pair_port is not None:
             items.append(PAIR_PORT)
         items.append(DEMO_PORT)
@@ -1013,6 +1040,7 @@ class App:
         entry = self.incoming.get(proto.file_data_id(payload))
         if not entry:
             return
+        self._last_file_rx = time.monotonic()
         f, t0, info = entry
         try:
             f.add(payload)
@@ -1571,7 +1599,8 @@ class App:
         """Explain problems in plain words, at most every 10 s."""
         if self.noise_bytes > 200 and now - self._noise_reported > 60:
             self._noise_reported = now
-            busy = bool(self.incoming)  # damaged file pieces during a transfer are normal on a busy radio
+            # damaged file pieces during (or just before the end of) a transfer are normal on a busy radio
+            busy = bool(self.incoming) or now - getattr(self, "_last_file_rx", 0.0) < 65
             self.note("warn", f"Radio noise: {self.noise_bytes:,} unreadable bytes ignored in the last minute"
                       + (" (damaged pieces of the file being received; they are re-sent automatically)." if busy else
                          ". If this keeps happening: same baud on both sides and in the ground unit menu? "
