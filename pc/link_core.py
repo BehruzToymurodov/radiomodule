@@ -84,6 +84,9 @@ class LinkWorker(threading.Thread):
         self.cwnd = self.CWND_START     # packets allowed in flight (congestion window)
         self.ssthresh = self.CWND_MAX / 2
         self._last_cut = 0.0
+        # pacing: send file pieces evenly at the rate the radio really delivers (measured from ACKs)
+        self._acked: deque[tuple[float, int]] = deque()  # (time, bytes) of recently confirmed packets
+        self.next_send = 0.0
         self._stop = threading.Event()
         self._tx_lock = threading.Lock()
         self._tx_seq = random.randrange(256)
@@ -187,6 +190,9 @@ class LinkWorker(threading.Thread):
                 return  # late ACK for something already confirmed
             del self._pending[seq]
             self.tx.delivered += 1
+            self._acked.append((now, len(p.frame)))
+            while self._acked and now - self._acked[0][0] > 3.0:
+                self._acked.popleft()
             if p.tries == 1:  # only clean samples (Karn's rule)
                 rtt = now - p.first
                 if self.srtt is None:
@@ -245,6 +251,36 @@ class LinkWorker(threading.Thread):
     def pending_count(self) -> int:
         with self._plock:
             return len(self._pending)
+
+    PACE_START, PACE_MIN, PACE_GAIN = 4000.0, 600.0, 1.25
+
+    @property
+    def delivery_bps(self) -> float | None:
+        """Bytes per second the other side confirmed over the last ~3 s (None until measured)."""
+        with self._plock:
+            if len(self._acked) < 4:
+                return None
+            span = self._acked[-1][0] - self._acked[0][0]
+            if span < 0.8:
+                return None
+            return sum(n for _, n in list(self._acked)[1:]) / span
+
+    @property
+    def pace_bps(self) -> float:
+        """How fast to feed file pieces into the radio: a bit above what it delivers, so it can speed up."""
+        rate = self.delivery_bps
+        return self.PACE_START if rate is None else max(self.PACE_MIN, rate * self.PACE_GAIN)
+
+    def wait_pace(self, nbytes: int, stop) -> bool:
+        """Sleep until it is time to send `nbytes` more. Returns False if stop() became true."""
+        while True:
+            now = time.monotonic()
+            if now >= self.next_send:
+                self.next_send = max(now - 0.05, self.next_send) + nbytes / self.pace_bps
+                return True
+            if stop():
+                return False
+            time.sleep(min(self.next_send - now, 0.01))
 
     @property
     def window(self) -> int:
@@ -319,6 +355,11 @@ def send_files(worker: LinkWorker, paths: list[str], events: queue.Queue, cancel
 
 FILE_TRIES = 40      # a file piece is re-sent up to 40 times (with back-off) before it counts as lost
 FILE_STALL_S = 60.0  # a file only fails if NOTHING got through for this long
+# The HM30 drops chunks of bytes in the middle of packets when its buffer is full, which ruins the
+# whole packet. Measured on an HM30-like simulated radio: 120-byte pieces sent evenly (paced) gave
+# ~45 % more speed and ~4x fewer re-sends than 235-byte pieces sent in bursts.
+FILE_PIECE = 120     # bytes of file per packet
+PACING = True        # spread pieces evenly at the measured delivery rate instead of bursting
 
 
 def _wait(group: dict, want: int, cancel: threading.Event, is_current, stall: float) -> bool:
@@ -344,7 +385,7 @@ def _send_one(worker, fid, out: proto.OutgoingFile, info, events, cancel, is_cur
         return {"ok": False, "cancelled": cancel.is_set(),
                 "error": "the receiver did not answer (is its app running and connected?)"}
 
-    pieces = proto.file_pieces(out.body)
+    pieces = proto.file_pieces(out.body, FILE_PIECE)
     group = {"ok": 0, "failed": 0}
     cap = 24 if worker.peer_is_app else 4  # an STM32 can only queue 8 packets
     last_report, last_ok, last_change = 0.0, -1, time.monotonic()
@@ -360,6 +401,8 @@ def _send_one(worker, fid, out: proto.OutgoingFile, info, events, cancel, is_cur
                 return {"ok": False, "error": f"nothing got through for {FILE_STALL_S:.0f} s (the link was lost)"}
             time.sleep(0.005)
         if cancel.is_set() or not is_current():
+            return {"ok": False, "cancelled": cancel.is_set(), "error": "cancelled"}
+        if PACING and not worker.wait_pace(len(data) + 12, lambda: cancel.is_set() or not is_current()):
             return {"ok": False, "cancelled": cancel.is_set(), "error": "cancelled"}
         worker.send_reliable(proto.TYPE_FILE_DATA, proto.file_data_payload(fid, offset, data), "file piece",
                              report=False, group=group, size=len(data), max_tries=FILE_TRIES)
@@ -493,9 +536,10 @@ class _Radio:
     and random packet loss."""
 
     def __init__(self, bytes_per_s: float, delay: float, loss: float,
-                 air_bps: float | None = None, buffer: int | None = None) -> None:
+                 air_bps: float | None = None, buffer: int | None = None, chunk: int | None = None) -> None:
         self.bps, self.delay, self.loss = bytes_per_s, delay, loss
         self.air_bps, self.buffer = air_bps, buffer
+        self.chunk = chunk  # the radio handles the byte stream in chunks; a full buffer drops a chunk
         self.items: deque[tuple[float, bytes]] = deque()
         self.cv = threading.Condition()
         self.busy_until = 0.0  # UART
@@ -504,19 +548,21 @@ class _Radio:
 
     def put(self, data: bytes) -> None:
         with self.cv:
-            now = time.monotonic()
-            self.busy_until = max(now, self.busy_until) + len(data) / self.bps
-            arrive = self.busy_until
-            if self.air_bps:
-                backlog = max(0.0, self.air_until - arrive) * self.air_bps
-                if self.buffer is not None and backlog + len(data) > self.buffer:
-                    self.dropped += 1  # radio buffer full: the packet is silently lost
-                    return
-                self.air_until = max(arrive, self.air_until) + len(data) / self.air_bps
-                arrive = self.air_until
-            if random.random() >= self.loss:
-                self.items.append((arrive + self.delay, data))
-                self.cv.notify()
+            pieces = [data] if not self.chunk else [data[i:i + self.chunk] for i in range(0, len(data), self.chunk)]
+            for part in pieces:
+                now = time.monotonic()
+                self.busy_until = max(now, self.busy_until) + len(part) / self.bps
+                arrive = self.busy_until
+                if self.air_bps:
+                    backlog = max(0.0, self.air_until - arrive) * self.air_bps
+                    if self.buffer is not None and backlog + len(part) > self.buffer:
+                        self.dropped += 1  # radio buffer full: these bytes are silently lost
+                        continue
+                    self.air_until = max(arrive, self.air_until) + len(part) / self.air_bps
+                    arrive = self.air_until
+                if random.random() >= self.loss:
+                    self.items.append((arrive + self.delay, part))
+            self.cv.notify()
 
     def get(self, timeout: float) -> bytes:
         end = time.monotonic() + timeout
@@ -553,9 +599,11 @@ class PairPort:
 
 
 def make_pair(baud: int = 115200, delay: float = 0.06, loss: float = 0.05,
-              air_bps: float | None = None, buffer: int | None = None) -> tuple[PairPort, PairPort]:
+              air_bps: float | None = None, buffer: int | None = None,
+              chunk: int | None = None) -> tuple[PairPort, PairPort]:
     """Two ports joined by a simulated radio: `loss` of packets lost in each direction.
-    air_bps/buffer: a radio slower than the UART with a small drop-when-full buffer."""
-    a_to_b = _Radio(baud / 10, delay, loss, air_bps, buffer)
-    b_to_a = _Radio(baud / 10, delay, loss, air_bps, buffer)
+    air_bps/buffer: a radio slower than the UART with a small drop-when-full buffer.
+    chunk: the radio drops chunks of this many bytes (so packets arrive damaged, like the HM30)."""
+    a_to_b = _Radio(baud / 10, delay, loss, air_bps, buffer, chunk)
+    b_to_a = _Radio(baud / 10, delay, loss, air_bps, buffer, chunk)
     return PairPort(a_to_b, b_to_a), PairPort(b_to_a, a_to_b)

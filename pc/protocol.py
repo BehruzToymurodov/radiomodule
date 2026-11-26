@@ -341,9 +341,10 @@ def file_data_payload(fid: int, offset: int, data: bytes) -> bytes:
     return _FILE_DATA_HDR.pack(fid & 0xFF, offset) + data
 
 
-def file_pieces(body: bytes) -> list[tuple[int, bytes]]:
-    """(offset, data) pieces that fit into FILE_DATA packets."""
-    return [(o, body[o:o + FILE_DATA_MAX]) for o in range(0, len(body), FILE_DATA_MAX)]
+def file_pieces(body: bytes, size: int = FILE_DATA_MAX) -> list[tuple[int, bytes]]:
+    """(offset, data) pieces that fit into FILE_DATA packets (size <= FILE_DATA_MAX)."""
+    size = max(1, min(size, FILE_DATA_MAX))
+    return [(o, body[o:o + size]) for o in range(0, len(body), size)]
 
 
 def safe_filename(name: str) -> str:

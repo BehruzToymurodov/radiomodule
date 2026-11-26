@@ -937,7 +937,9 @@ class App:
             text = item.text.strip()
             if not text:
                 return
-            if readable(text):  # e.g. printf from an STM32
+            if peer_app and len(text) < 8:  # another app never sends tiny raw scraps: a damaged piece
+                self.noise_bytes += len(text)
+            elif readable(text):  # e.g. printf from an STM32
                 self.note("in", f"Text: {clip(text)}")
                 self.chat_bubble("them", clip(text), ts)
                 self.alert("message")
@@ -1567,11 +1569,13 @@ class App:
 
     def _watch_quality(self, now: float, st: proto.ParserStats) -> None:
         """Explain problems in plain words, at most every 10 s."""
-        if self.noise_bytes and now - self._noise_reported > 10:
+        if self.noise_bytes > 200 and now - self._noise_reported > 60:
             self._noise_reported = now
-            self.note("warn", f"Radio noise: {self.noise_bytes:,} unreadable bytes were ignored. If this keeps "
-                              "happening: same baud on both sides and in the ground unit menu? Only ONE device "
-                              "connected to the air unit UART? GND wire connected?")
+            busy = bool(self.incoming)  # damaged file pieces during a transfer are normal on a busy radio
+            self.note("warn", f"Radio noise: {self.noise_bytes:,} unreadable bytes ignored in the last minute"
+                      + (" (damaged pieces of the file being received; they are re-sent automatically)." if busy else
+                         ". If this keeps happening: same baud on both sides and in the ground unit menu? "
+                         "Only ONE device on the air unit UART? GND wire connected?"))
             self.noise_bytes = 0
         tx = self.worker.tx if self.worker else core.TxStats()
         mark = (now, st.frames, st.crc_errors, st.lost, tx.sent, tx.retries)
