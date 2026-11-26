@@ -6,13 +6,14 @@
 
 The other side can be an STM32 (with firmware/link.c) or another PC running this app.
 HM30 ground unit: Datalink Mode = Type-C, Baud = the same value as the other side.
-Only dependency besides the standard library: pyserial (pip install pyserial).
+Needs pyserial (pip install pyserial). Optional: Pillow (pip install pillow) for photo previews.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
 import os
@@ -35,6 +36,16 @@ try:
 except ImportError:  # the app still starts in --demo / --pair mode
     serial = None
 
+try:  # photo previews in the chat (optional)
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = ImageTk = None
+
+try:  # sound for notifications (Windows)
+    import winsound
+except ImportError:
+    winsound = None
+
 HM30_VID, HM30_PID = 0x0483, 0x5740  # HM30 ground unit USB serial (as seen on Windows)
 DEMO_PORT = "DEMO (fake STM32 data)"
 PAIR_PORT = "PAIR (simulated radio to the other window)"
@@ -45,6 +56,12 @@ MAX_POINTS = 5000
 MAX_CSV_ROWS = 500_000
 BIG_FILE_ASK = 60      # ask before sending files that would take longer than this (s)
 EVENT_BUDGET_S = 0.03  # handle incoming data in short slices so the window never freezes
+RECONNECT_EVERY_MS = 2000
+RESUME_WAIT_S = 12     # after reconnecting, wait this long for the other side before re-sending files
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+THUMB_SIZE = (260, 180)
+MAX_THUMBS = 60
+MAX_TRANSFERS = 500
 
 SEND_MODES = ["Text", "Command", "Number", "Bytes (hex)", "Files", "Plain text line"]
 SEND_HINTS = {
@@ -112,6 +129,66 @@ def open_folder(path: str) -> None:
         subprocess.Popen(["xdg-open", path])
 
 
+def resource(name: str) -> str:
+    """A file next to this script, or inside the .exe (PyInstaller unpacks to sys._MEIPASS)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
+def set_icon(window) -> None:
+    try:
+        if sys.platform.startswith("win") and os.path.exists(resource("hm30_link.ico")):
+            window.iconbitmap(resource("hm30_link.ico"))
+        elif os.path.exists(resource("hm30_link_icon.png")):
+            window.iconphoto(True, tk.PhotoImage(file=resource("hm30_link_icon.png")))
+    except tk.TclError:
+        pass
+
+
+def open_file(path: str) -> None:
+    if sys.platform.startswith("win"):
+        os.startfile(path)  # type: ignore[attr-defined]
+    else:
+        open_folder(path)
+
+
+def is_image(name: str) -> bool:
+    return os.path.splitext(name)[1].lower() in IMAGE_EXT
+
+
+def make_thumbnail(source) -> "ImageTk.PhotoImage | None":
+    """source: a path or bytes. Returns a small Tk image, or None (no Pillow / not an image)."""
+    if Image is None:
+        return None
+    try:
+        img = Image.open(io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source)
+        img.draft("RGB", (THUMB_SIZE[0] * 2, THUMB_SIZE[1] * 2))  # fast JPEG decode at reduced size
+        img = img.convert("RGB")
+        img.thumbnail(THUMB_SIZE)
+        return ImageTk.PhotoImage(img)
+    except Exception:
+        return None
+
+
+def flash_taskbar(window) -> None:
+    """Make the taskbar button blink until the window is focused (Windows only)."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("hwnd", wintypes.HWND), ("dwFlags", wintypes.DWORD),
+                        ("uCount", wintypes.UINT), ("dwTimeout", wintypes.DWORD)]
+
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, 0x3 | 0xC, 0, 0)  # FLASHW_ALL | FLASHW_TIMERNOFG
+        ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+    except Exception:
+        pass
+
+
 def readable(text: str) -> bool:
     """True for normal text (e.g. printf from an STM32), False for radio noise."""
     if not text:
@@ -128,8 +205,7 @@ def clip(text: str) -> str:
 def friendly_error(msg: str) -> str:
     low = msg.lower()
     if any(k in low for k in ("access is denied", "permissionerror", "clearcommerror", "device", "could not")):
-        return ("the USB adapter / ground unit was unplugged or stopped responding. "
-                "Check the USB cable, then click Connect.")
+        return "the USB adapter / ground unit was unplugged or stopped responding"
     return msg
 
 
@@ -174,8 +250,21 @@ class App:
         self._quality_mark: tuple[float, int, int, int] | None = None
         self._scroll: set = set()
         self.lost_connection = False
+        # auto-reconnect
+        self.port_label: str | None = None        # what we are connected to (real serial ports only)
+        self.port_ids: tuple | None = None        # (vid, pid, serial number) to find the adapter again
+        self.reconnecting = False
+        self.reconnect_tries = 0
+        self.files_left: list[str] = []           # files not yet confirmed (re-sent after a reconnect)
+        self.files_user_cancelled = False
+        # transfers, notifications, previews
+        self.transfers: list[dict] = []
+        self.unread = 0
+        self._last_sound = 0.0
+        self._thumbs: deque = deque(maxlen=MAX_THUMBS)  # keep Tk images alive
 
         root.title(title)
+        set_icon(root)
         root.geometry("1280x820")
         root.minsize(1000, 640)
         root.configure(bg=C["bg"])
@@ -183,6 +272,8 @@ class App:
         self._build_ui()
         self.refresh_ports(select=DEMO_PORT if demo else PAIR_PORT if pair_port else None)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.bind("<FocusIn>", self._on_focus, add="+")
+        self._load_transfers()
         root.after(50, self.poll_events)
         root.after(500, self.update_status)
         root.after(150, self.redraw_plot)
@@ -320,22 +411,26 @@ class App:
 
         # left: Chat / Log
         left_outer = tk.Frame(main, bg=C["border"])
-        main.add(left_outer, weight=3)
+        main.add(left_outer, weight=5)
         left = ttk.Frame(left_outer, style="Card.TFrame", padding=(6, 6, 6, 6))
         left.pack(fill="both", expand=True, padx=1, pady=1)
         self.tabs = ttk.Notebook(left)
         self.tabs.pack(fill="both", expand=True)
         self.chat = self._text_tab("  Chat  ", font=("Segoe UI", 10), bg="white", wrap="word")
         self.log_text = self._text_tab("  Log  ", font=("Segoe UI", 9), bg="#fbfcfe", wrap="word")
+        self._build_transfers_tab()
         self._chat_tags()
         self._log_tags()
         opts = ttk.Frame(left, style="Card.TFrame")
         opts.pack(fill="x", pady=(6, 0))
         self.tech_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Show technical details in Log", variable=self.tech_var,
+        ttk.Checkbutton(opts, text="Technical details in Log", variable=self.tech_var,
                         command=self._apply_tech).pack(side="left")
         self.autoscroll_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="Auto-scroll", variable=self.autoscroll_var).pack(side="left", padx=14)
+        ttk.Checkbutton(opts, text="Auto-scroll", variable=self.autoscroll_var).pack(side="left", padx=12)
+        self.notify_var = tk.BooleanVar(value=self.settings.get("notify", True))
+        ttk.Checkbutton(opts, text="Sound + blink when something arrives", variable=self.notify_var,
+                        command=self._on_notify_change).pack(side="left")
 
         # right: values + graph
         right = ttk.PanedWindow(main, orient="vertical")
@@ -371,6 +466,40 @@ class App:
         ttk.Label(bar, text="last", style="CardMuted.TLabel").pack(side="right", padx=4)
         self.canvas = tk.Canvas(plot, bg="white", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, pady=(6, 0))
+
+    def _build_transfers_tab(self) -> None:
+        frame = ttk.Frame(self.tabs, style="Card.TFrame", padding=(4, 6, 4, 4))
+        self.tabs.add(frame, text="  Transfers  ")
+        bar = ttk.Frame(frame, style="Card.TFrame")
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Label(bar, text="Every file sent and received. Double-click a row to open its folder.",
+                  style="CardMuted.TLabel").pack(side="left")
+        self.tr_folder_btn = ttk.Button(bar, text="Open folder", command=lambda: self._open_transfer(False),
+                                        state="disabled")
+        self.tr_folder_btn.pack(side="right")
+        self.tr_open_btn = ttk.Button(bar, text="Open file", command=lambda: self._open_transfer(True),
+                                      state="disabled")
+        self.tr_open_btn.pack(side="right", padx=6)
+        cols = ("dir", "name", "size", "dur", "speed", "status")
+        box = ttk.Frame(frame, style="Card.TFrame")
+        box.pack(fill="both", expand=True)
+        self.tr_table = ttk.Treeview(box, columns=cols, show="tree headings", selectmode="browse")
+        self.tr_table.heading("#0", text="When")
+        self.tr_table.column("#0", width=92, stretch=False)
+        for c, w, title, anchor in (("dir", 82, "", "w"), ("name", 150, "File", "w"), ("size", 66, "Size", "e"),
+                                    ("dur", 50, "Time", "e"), ("speed", 78, "Speed", "e"),
+                                    ("status", 175, "Status", "w")):
+            self.tr_table.heading(c, text=title, anchor=anchor)
+            self.tr_table.column(c, width=w, anchor=anchor, stretch=(c in ("name", "status")))
+        sb = ttk.Scrollbar(box, command=self.tr_table.yview)
+        self.tr_table.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tr_table.pack(side="left", fill="both", expand=True)
+        self.tr_table.tag_configure("ok", foreground=C["ok"])
+        self.tr_table.tag_configure("bad", foreground=C["err"])
+        self.tr_table.tag_configure("warn", foreground=C["warn"])
+        self.tr_table.bind("<<TreeviewSelect>>", lambda _e: self._on_transfer_select())
+        self.tr_table.bind("<Double-1>", lambda _e: self._open_transfer(False))
 
     def _text_tab(self, title: str, **kw) -> tk.Text:
         frame = ttk.Frame(self.tabs, style="Card.TFrame")
@@ -445,6 +574,7 @@ class App:
         self._persist()
         self._show_save_dir()
         self.note("info", f"Received files and logs will be saved to {d}")
+        self._load_transfers()
         if self.worker:
             self._open_session_log()
 
@@ -519,14 +649,24 @@ class App:
             self.port_var.set(best or items[0])
 
     def toggle_connect(self) -> None:
-        if self.worker:
+        if self.worker or self.reconnecting:
+            was_reconnecting = self.reconnecting
             self.disconnect()
-            self.note("info", "Disconnected.")
+            self.note("info", "Stopped reconnecting." if was_reconnecting else "Disconnected.")
         else:
             self.connect()
 
-    def connect(self) -> None:
+    @staticmethod
+    def _port_info(device: str):
+        if serial is None:
+            return None
+        return next((p for p in serial.tools.list_ports.comports() if p.device == device), None)
+
+    def connect(self, auto: bool = False) -> bool:
+        """Open the selected port. auto=True: a reconnect attempt (no pop-ups, quiet failures)."""
         label = self.port_var.get()
+        device = label.split(" — ")[0]
+        ids = None
         try:
             if label == DEMO_PORT:
                 port = core.DemoSerial()
@@ -536,33 +676,119 @@ class App:
             else:
                 if serial is None:
                     messagebox.showerror("HM30 Link", "pyserial is not installed.\n\npip install pyserial")
-                    return
-                device = label.split(" — ")[0]
+                    return False
+                info = self._port_info(device)
+                ids = (info.vid, info.pid, info.serial_number) if info and info.vid is not None else None
                 port = serial.Serial(device, int(self.baud_var.get()), timeout=0.1, write_timeout=2)
         except Exception as exc:
-            self.note("err", f"Could not open {label.split(' — ')[0]}: {exc}")
-            messagebox.showerror("HM30 Link", f"Could not open {label}:\n\n{exc}\n\n"
-                                 "Close PuTTY or any other program using the port, check the USB cable, "
-                                 "then try again.")
-            return
+            if not auto:
+                self.note("err", f"Could not open {device}: {exc}")
+                messagebox.showerror("HM30 Link", f"Could not open {label}:\n\n{exc}\n\n"
+                                     "Close PuTTY or any other program using the port, check the USB cable, "
+                                     "then try again.")
+            return False
+        is_real = label not in (DEMO_PORT, PAIR_PORT)
+        self.port_label = label if is_real else None
+        self.port_ids = ids
         self.worker = core.LinkWorker(port, self.events)
         self.worker.start()
         self.lost_connection = False
+        self.reconnecting = False
         self.connect_btn.configure(text="Disconnect", style="Danger.TButton")
-        self.note("info", f"Connected to {label.split(' — ')[0]} at {self.baud_var.get()} baud. "
-                          "Waiting for the other side to answer…")
+        if auto:
+            self.note("ok", f"Reconnected to {device}. Everything continues.")
+            self.chat_center("Reconnected")
+            if self.files_left and not self.files_user_cancelled:
+                self._resume_files(time.monotonic())
+        else:
+            self.note("info", f"Connected to {device} at {self.baud_var.get()} baud. "
+                              "Waiting for the other side to answer…")
         self._quality_mark = None
         self._open_session_log()
+        return True
 
-    def disconnect(self) -> None:
+    def disconnect(self, keep_files: bool = False) -> None:
+        """Close the link. keep_files=True when the link broke (files will be re-sent after reconnecting)."""
         if self.file_cancel:
+            if not keep_files:
+                self.files_user_cancelled = True
+                self.files_left = []
             self.file_cancel.set()
         if self.worker:
             self.worker.stop()
             self.worker = None
-        self.connect_btn.configure(text="Connect", style="Accent.TButton")
+        if not keep_files:
+            self.reconnecting = False
+        self.connect_btn.configure(text="Stop reconnecting" if self.reconnecting else "Connect",
+                                   style="Danger.TButton" if self.reconnecting else "Accent.TButton")
         self.incoming.clear()
         self._close_session_log()
+
+    # ---- auto-reconnect -------------------------------------------------------
+
+    def _connection_lost(self, error: str) -> None:
+        msg = friendly_error(error)
+        self.note("tech", f"error: {error}", tech=True)
+        if self.port_label is None:  # demo / pair: nothing to reconnect to
+            self.note("err", f"Connection lost: {msg}.")
+            self.chat_center(f"Connection lost — {msg}", bad=True)
+            self.lost_connection = True
+            self.disconnect()
+            return
+        self.reconnecting = True
+        self.reconnect_tries = 0
+        self.disconnect(keep_files=True)
+        self.note("warn", f"Connection lost: {msg}. Reconnecting automatically — plug it back in, "
+                          "or click \"Stop reconnecting\".")
+        self.chat_center("Connection lost — reconnecting…", bad=True)
+        self.root.after(RECONNECT_EVERY_MS, self._try_reconnect)
+
+    def _find_port_again(self) -> str | None:
+        """The label of our adapter, even if Windows gave it another COM number."""
+        if serial is None or self.port_label is None:
+            return None
+        device = self.port_label.split(" — ")[0]
+        ports = list(serial.tools.list_ports.comports())
+        if self.port_ids:
+            for p in ports:
+                if (p.vid, p.pid, p.serial_number) == self.port_ids:
+                    device = p.device
+                    break
+            else:
+                return None
+        elif not any(p.device == device for p in ports):
+            return None
+        self.refresh_ports()
+        return next((v for v in self.port_box["values"] if v.split(" — ")[0] == device), None)
+
+    def _try_reconnect(self) -> None:
+        if not self.reconnecting or self.worker:
+            return
+        self.reconnect_tries += 1
+        label = self._find_port_again()
+        if label:
+            self.port_var.set(label)
+            if self.connect(auto=True):
+                return
+        if self.reconnect_tries % 15 == 0:  # remind every ~30 s
+            self.note("warn", "Still trying to reconnect… Check that the USB cable is plugged in.")
+        self.root.after(RECONNECT_EVERY_MS, self._try_reconnect)
+
+    def _resume_files(self, started: float) -> None:
+        """After a reconnect: wait until the other side answers, then send the unfinished files again."""
+        w = self.worker
+        if not w or not self.files_left or self.files_user_cancelled or self.file_cancel:
+            return
+        if w.peer_is_app or w.hello_ok:
+            files = list(self.files_left)
+            self.note("out", f"Sending {len(files)} unfinished file(s) again after the reconnect…")
+            self.send_files(files, resumed=True)
+        elif time.monotonic() - started < RESUME_WAIT_S:
+            self.root.after(500, self._resume_files, started)
+        else:
+            self.note("warn", f"The other side did not answer after the reconnect. {len(self.files_left)} "
+                              "file(s) were not sent — send them again when it is back.")
+            self.files_left = []
 
     def on_close(self) -> None:
         self.disconnect()
@@ -592,12 +818,7 @@ class App:
             for item in items:
                 self.handle_item(ts, item)
         elif kind == "error":
-            msg = friendly_error(ev[1])
-            self.note("err", f"Connection lost: {msg}")
-            self.note("tech", f"error: {ev[1]}", tech=True)
-            self.chat_center(f"Connection lost — {msg}", bad=True)
-            self.lost_connection = True
-            self.disconnect()
+            self._connection_lost(ev[1])
         elif kind == "closed":
             self.note("tech", "port closed", tech=True)
         elif kind == "info":
@@ -619,6 +840,8 @@ class App:
         elif kind == "files_done":
             self.file_cancel = None
             self.send_btn.configure(text="Send  ➤", style="Accent.TButton")
+            if not self.reconnecting:
+                self.files_left = []
 
     def handle_item(self, ts: float, item) -> None:
         stamp = datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3]
@@ -630,6 +853,7 @@ class App:
             if readable(text):  # e.g. printf from an STM32
                 self.note("in", f"Text: {clip(text)}")
                 self.chat_bubble("them", clip(text), ts)
+                self.alert("message")
                 self._record(stamp, "in", "raw", "", text)
             else:  # radio noise / wrong baud / two devices on one UART: count it, do not draw it
                 self.noise_bytes += len(text)
@@ -651,6 +875,7 @@ class App:
             if peer_app:  # an STM32 streams values all the time: keep those out of chat and log
                 self.note("in", f"Number: {clip(name)} = {value:.6g}")
                 self.chat_bubble("them", f"{clip(name)} = {value:.6g}", ts)
+                self.alert("number")
             else:
                 self.note("tech", f"value {clip(name)} = {value:.6g}", tech=True)
         elif t == proto.TYPE_BYTES:
@@ -670,6 +895,7 @@ class App:
             what = "Message" if t == proto.TYPE_TEXT else "Command" if t == proto.TYPE_CMD else item.type_name
             self.note("in", f"{what}: {text}")
             self.chat_bubble("them", text if t == proto.TYPE_TEXT else f"[{what}] {text}", ts)
+            self.alert("message")
             self._record(stamp, "in", "text" if t == proto.TYPE_TEXT else item.type_name.lower(), "", item.text())
 
     def _record(self, stamp: str, direction: str, kind: str, name: str, value: str) -> None:
@@ -723,6 +949,9 @@ class App:
                              "Ask the sender to send it again.")
             self.chat_center(f"✖ {f.name} arrived damaged and was not saved", bad=True)
             self.show_progress(None)
+            self.add_transfer("in", f.name, f.original_size, time.monotonic() - t0, "✖ damaged, not saved", "",
+                              "bad")
+            self.alert(f"{f.name} arrived damaged")
             return
         folder = self._ensure_dir()
         if not folder:
@@ -739,8 +968,11 @@ class App:
         self.note("ok", f"Saved {os.path.basename(path)} — {human_size(len(data))} in {human_time(secs)} "
                         f"({human_size(len(data) / secs)}/s), checked OK → {path}")
         self.chat_bubble("them", f"📁 {os.path.basename(path)}  ({human_size(len(data))})  ✔ saved",
-                         tag2="file", link=(" open folder ", os.path.dirname(path)))
+                         tag2="file", link=(" open folder ", os.path.dirname(path)),
+                         image=path if is_image(path) else None)
         self._record(stamp, "in", "file", os.path.basename(path), path)
+        self.add_transfer("in", os.path.basename(path), len(data), secs, "✔ received, checked", path, "ok")
+        self.alert(f"File received: {os.path.basename(path)}")
 
     # ---- chat / log ---------------------------------------------------------
 
@@ -756,7 +988,8 @@ class App:
             self._scroll.add(widget)
 
     def chat_bubble(self, who: str, text: str, ts: float | None = None, token: int | None = None,
-                    parts: int = 1, tag2: str | None = None, link: tuple[str, str] | None = None) -> None:
+                    parts: int = 1, tag2: str | None = None, link: tuple[str, str] | None = None,
+                    image: str | None = None) -> None:
         if self.paused:
             return
         stamp = datetime.fromtimestamp(ts or time.time()).strftime("%H:%M")
@@ -776,8 +1009,125 @@ class App:
             c.mark_gravity(mark, "left")
             self.chat_marks[token] = {"mark": mark, "left": parts, "failed": 0}
         c.insert("end", "\n")
+        thumb = make_thumbnail(image) if image else None
+        if thumb is not None:  # photo preview; click it to open the photo
+            self._thumbs.append(thumb)
+            self._links = getattr(self, "_links", 0) + 1
+            ltag = f"img{self._links}"
+            start = c.index("end-1c")
+            c.image_create("end", image=thumb, padx=4, pady=4)
+            c.tag_add(who, start)
+            c.tag_add(ltag, start)
+            c.tag_add("link", start)
+            c.tag_bind(ltag, "<Button-1>", lambda _e, p=image: open_file(p))
+            c.insert("end", "\n", (who,))
         c.configure(state="disabled")
         self._append(c, [])
+
+    # ---- notifications ------------------------------------------------------
+
+    def _has_focus(self) -> bool:
+        try:
+            w = self.root.focus_get()
+        except (KeyError, tk.TclError):  # focus is in a dialog / another window
+            return False
+        return w is not None and w.winfo_toplevel() is self.root
+
+    def alert(self, what: str) -> None:
+        """Something arrived: if the window is in the background, count it, blink and beep."""
+        if self._has_focus():
+            return
+        self.unread += 1
+        self.root.title(f"({self.unread}) {self.title}")
+        if not self.notify_var.get():
+            return
+        flash_taskbar(self.root)
+        now = time.monotonic()
+        if winsound and now - self._last_sound > 3:
+            self._last_sound = now
+            try:
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            except Exception:
+                pass
+
+    def _on_focus(self, _event=None) -> None:
+        if self.unread:
+            self.unread = 0
+            self.root.title(self.title)
+
+    def _on_notify_change(self) -> None:
+        self.settings["notify"] = self.notify_var.get()
+        self._persist()
+
+    # ---- transfers history ----------------------------------------------------
+
+    def _transfers_csv(self) -> str:
+        return os.path.join(self.save_dir(), "logs", "transfers.csv")
+
+    def _load_transfers(self) -> None:
+        self.transfers.clear()
+        self.tr_table.delete(*self.tr_table.get_children())
+        try:
+            with open(self._transfers_csv(), newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))[-MAX_TRANSFERS:]
+        except OSError:
+            return
+        for r in rows:
+            try:
+                r["size"] = int(r["size"])
+                r["secs"] = float(r["secs"]) if r.get("secs") else None
+            except (KeyError, ValueError):
+                continue
+            self._show_transfer(r)
+
+    def add_transfer(self, direction: str, name: str, size: int, secs: float | None, status: str, path: str,
+                     tag: str) -> None:
+        r = {"when": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "dir": direction, "name": name,
+             "size": size, "secs": secs, "status": status, "path": path, "tag": tag}
+        self._show_transfer(r)
+        d = self._ensure_dir("logs")
+        if not d:
+            return
+        path_csv = self._transfers_csv()
+        new = not os.path.exists(path_csv)
+        try:
+            with open(path_csv, "a", newline="", encoding="utf-8") as f:
+                wr = csv.DictWriter(f, fieldnames=list(r))
+                if new:
+                    wr.writeheader()
+                wr.writerow({**r, "secs": "" if secs is None else f"{secs:.2f}"})
+        except OSError:
+            pass
+
+    def _show_transfer(self, r: dict) -> None:
+        self.transfers.append(r)
+        secs, size = r.get("secs"), r["size"]
+        speed = f"{human_size(size / secs)}/s" if secs and secs > 0 and r.get("tag") == "ok" else ""
+        when = r["when"][5:16].replace("-", ".") if len(r["when"]) >= 16 else r["when"]
+        iid = str(len(self.transfers) - 1)
+        self.tr_table.insert("", 0, iid=iid, text=when, tags=(r.get("tag", ""),), values=(
+            "⬆ sent" if r["dir"] == "out" else "⬇ received", r["name"], human_size(size),
+            human_time(secs) if secs else "", speed, r["status"]))
+        kids = self.tr_table.get_children()
+        if len(kids) > MAX_TRANSFERS:
+            self.tr_table.delete(*kids[MAX_TRANSFERS:])
+
+    def _selected_transfer(self) -> dict | None:
+        sel = self.tr_table.selection()
+        return self.transfers[int(sel[0])] if sel else None
+
+    def _on_transfer_select(self) -> None:
+        r = self._selected_transfer()
+        ok = bool(r and r.get("path") and os.path.exists(r["path"]))
+        self.tr_open_btn.configure(state="normal" if ok else "disabled")
+        self.tr_folder_btn.configure(state="normal" if ok else "disabled")
+
+    def _open_transfer(self, the_file: bool) -> None:
+        r = self._selected_transfer()
+        if not r or not r.get("path") or not os.path.exists(r["path"]):
+            self.note("warn", "This file is not on this PC (any more).")
+            return
+        open_file(r["path"]) if the_file else open_folder(os.path.dirname(r["path"]))
 
     def chat_center(self, text: str, bad: bool = False) -> None:
         self._append(self.chat, [(f"{text}\n", ("center", "bad") if bad else ("center",))])
@@ -925,7 +1275,7 @@ class App:
 
     # ---- sending files ------------------------------------------------------
 
-    def send_files(self, paths: list[str]) -> None:
+    def send_files(self, paths: list[str], resumed: bool = False) -> None:
         paths = [p for p in paths if p]
         missing = [p for p in paths if not os.path.isfile(p)]
         if missing or not paths:
@@ -933,13 +1283,15 @@ class App:
             return
         total = sum(os.path.getsize(p) for p in paths)
         bps = int(self.baud_var.get()) / 10 * 0.7  # rough, before compression
-        if total / bps > BIG_FILE_ASK and not messagebox.askyesno(
+        if not resumed and total / bps > BIG_FILE_ASK and not messagebox.askyesno(
             "HM30 Link", f"{len(paths)} file(s), {human_size(total)}.\nThis can take about "
                          f"{human_time(total / bps)} at {self.baud_var.get()} baud (less if it compresses well)."
                          "\n\nSend?"):
             return
         for p in paths:
             self._remember(p)
+        self.files_left = list(paths)
+        self.files_user_cancelled = False
         worker = self.worker
         cancel = self.file_cancel = threading.Event()
         self.send_btn.configure(text="Cancel", style="Danger.TButton")
@@ -957,11 +1309,13 @@ class App:
         self.note("out", f"Sending file {info['name']}{count} — {human_size(info['size'])}{extra}…")
         token = self.worker.new_token() if self.worker else None
         self._file_token = token
-        self.chat_bubble("me", f"📎 {info['name']}  ({human_size(info['size'])})", token=token, tag2="file")
+        self.chat_bubble("me", f"📎 {info['name']}  ({human_size(info['size'])})", token=token, tag2="file",
+                         image=info.get("path") if is_image(info["name"]) else None)
         self.show_progress({**info, "dir": "send", "frac": 0.0, "speed": 0.0, "eta": math.inf})
 
     def on_file_sent(self, info: dict) -> None:
         token = self._file_token
+        path = info.get("path", "")
         if info.get("ok"):
             self.note("ok", f"Sent {info['name']} — {human_size(info['size'])} in {human_time(info['secs'])} "
                             f"({human_size(info['speed'])}/s). The other side confirmed every piece.")
@@ -969,18 +1323,31 @@ class App:
                 self._chat_mark(token, True)
             self.show_progress({**info, "dir": "send", "frac": 1.0, "speed": info["speed"], "eta": 0},
                                done_text=f"Sent {info['name']}  ✔")
-            self._record(datetime.now().strftime("%H:%M:%S.%f")[:-3], "out", "file", info["name"],
-                         info.get("path", ""))
+            self._record(datetime.now().strftime("%H:%M:%S.%f")[:-3], "out", "file", info["name"], path)
+            if path in self.files_left:
+                self.files_left.remove(path)
+            self.add_transfer("out", info["name"], info["size"], info["secs"], "✔ sent", path, "ok")
+        elif self.reconnecting:  # the link broke: it is sent again automatically after the reconnect
+            self.note("warn", f"Sending {info['name']} was interrupted by the connection loss. "
+                              "It will be sent again automatically after reconnecting.")
+            if token is not None:
+                self._chat_mark(token, False)
+            self.show_progress(None)
+            self.add_transfer("out", info["name"], info["size"], None, "⟳ interrupted, retried", path, "warn")
         elif info.get("cancelled"):
             self.note("warn", f"Sending {info['name']} was cancelled.")
             if token is not None:
                 self._chat_mark(token, False)
             self.show_progress(None)
+            self.add_transfer("out", info["name"], info["size"], None, "cancelled", path, "warn")
         else:
             self.note("err", f"File {info['name']} was NOT delivered: {info.get('error', 'failed')}")
             if token is not None:
                 self._chat_mark(token, False)
             self.show_progress(None)
+            if path in self.files_left:
+                self.files_left.remove(path)
+            self.add_transfer("out", info["name"], info.get("size", 0), None, "✖ not delivered", path, "bad")
 
     def show_progress(self, p: dict | None, done_text: str | None = None) -> None:
         if p is None:
@@ -1030,7 +1397,9 @@ class App:
         while self.rate_hist and now - self.rate_hist[0][0] > 3:
             self.rate_hist.popleft()
 
-        if not w:
+        if not w and self.reconnecting:
+            self._set_badge(f"⟳ Reconnecting… (try {self.reconnect_tries})", C["warn"])
+        elif not w:
             if self.lost_connection:
                 self._set_badge("✖ Connection lost", C["err"])
             else:

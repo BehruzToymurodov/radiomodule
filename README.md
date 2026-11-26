@@ -17,30 +17,41 @@ STM32 or PC ─UART─► HM30 AIR unit  ~~~ 5.8 GHz ~~~  HM30 GROUND unit ─US
 
 ## PC app
 
-Needs Python 3.10+ and pyserial:
+**Easiest: `HM30Link.exe`** — one file, no Python needed. Double-click it.
+(Windows may warn about an unknown publisher: *More info → Run anyway*.)
+Build it yourself with `pc\build_exe.bat` (result: `pc\dist\HM30Link.exe`).
+
+**Or with Python 3.10+:**
 
 ```powershell
-pip install pyserial
 cd pc
+pip install -r requirements.txt
 python hm30_link_app.py            # real hardware
 python hm30_link_app.py --demo     # fake STM32 data, no hardware
 python hm30_link_app.py --pair     # two windows joined by a simulated radio (try PC-to-PC)
 ```
 
-The app needs all three files in `pc/`: `hm30_link_app.py`, `protocol.py`, `link_core.py`.
+The app needs `hm30_link_app.py`, `protocol.py`, `link_core.py` (and the two icon files) from `pc/`.
 
 What it does:
 
-- **Chat** tab (message bubbles, ✔ when the other side confirmed, "open folder" on received files)
-- **Log** tab in plain words (✔ done, ⚠ warning, ✖ problem); tick *Show technical details* for packet-level info.
+- **Chat** tab: message bubbles, ✔ when the other side confirmed; received photos show a preview
+  (click it to open), every received file has an "open folder" link
+- **Log** tab in plain words (✔ done, ⚠ warning, ✖ problem); tick *Technical details* for packet-level info.
   Radio noise is counted and explained once instead of filling the screen.
+- **Transfers** tab: every file sent and received (time, size, speed, status) with *Open file* /
+  *Open folder*; kept in `logs/transfers.csv`
+- **Auto-reconnect**: if the USB adapter or ground unit disconnects, the app keeps trying (even if
+  Windows gives it another COM number) and re-sends unfinished files when it is back
+- **Notifications**: when the window is in the background, new messages and files make it beep,
+  blink in the taskbar and show the unread count in the title (can be switched off)
 - **Values** table and live **graph** for numbers the other side sends
 - **Send**: Text, Command, Number (`speed=1.5, angle=-30`), Bytes (hex), Files, Plain text line
 - **Files**: pick several at once; progress bar with speed and time left; text-like files are
   compressed automatically; the receiver checks a CRC-32 before saving
 - **Received files and logs** go to a folder the receiver chooses on first start
-  (button *Change…*, *📂 Open*); every session is also logged to `logs/session_….csv`
-- Status bar: packets in (ok / damaged / lost / quality) and out (sent / confirmed / re-sent / failed), delay
+  (*Change…*, *Open folder*); every session is also logged to `logs/session_….csv`
+- Status bar: link quality, delay, packets received (damaged / lost) and sent (confirmed / re-sent / failed)
 
 ## HM30 settings (ground unit OLED menu)
 
