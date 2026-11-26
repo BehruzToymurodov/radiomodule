@@ -75,14 +75,36 @@ SEND_HINTS = {
 
 # ---- look --------------------------------------------------------------------------
 C = {
-    "bg": "#f3f5f9", "card": "#ffffff", "border": "#dde2ea", "text": "#1f2937", "muted": "#6b7280",
+    "bg": "#f3f5f9", "card": "#ffffff", "border": "#dde2ea", "text": "#111827", "muted": "#4b5563",
+    "faint": "#6b7280",
     "header": "#1e293b", "header_text": "#f8fafc", "accent": "#2563eb", "accent_dark": "#1d4ed8",
     "ok": "#16a34a", "warn": "#d97706", "err": "#dc2626", "info": "#475569", "in": "#2563eb", "out": "#0f766e",
     "me_bg": "#dcfce7", "me_fg": "#14532d", "them_bg": "#eef2f7", "them_fg": "#1f2937", "grid": "#eef1f5",
 }
 PLOT_COLORS = ["#2563eb", "#dc2626", "#16a34a", "#d97706", "#7c3aed", "#0891b2", "#db2777", "#4b5563"]
-FONT = ("Segoe UI", 10)
-FONT_BOLD = ("Segoe UI", 10, "bold")
+# Named fonts: every widget refers to these names, so changing a size (Ctrl +/-) updates the whole
+# window at once. Sizes are in points at zoom 100 %; nothing is smaller than 10 pt for easy reading.
+FONT_SPECS = {          # name: (size, weight, slant, family kind)
+    "f_base": (11, "normal", "roman", "ui"),
+    "f_bold": (11, "bold", "roman", "ui"),
+    "f_small": (10, "normal", "roman", "ui"),
+    "f_small_bold": (10, "bold", "roman", "ui"),
+    "f_italic": (10, "normal", "italic", "ui"),
+    "f_title": (12, "bold", "roman", "ui"),
+    "f_header": (16, "bold", "roman", "ui"),
+    "f_entry": (12, "normal", "roman", "ui"),
+    "f_mono": (10, "normal", "roman", "mono"),
+    "f_icon": (11, "bold", "roman", "symbol"),
+}
+FONT, FONT_BOLD = "f_base", "f_bold"
+ZOOM_STEPS = [0.85, 0.92, 1.0, 1.1, 1.2, 1.35, 1.5, 1.7]
+PLOT_MS, PLOT_IDLE_MS = 40, 250  # graph refresh while data is moving / while idle
+UI_SCALE = 1.0                   # screen pixels per 1/96 inch (set at start from the display DPI)
+
+
+def px(n: float) -> int:
+    """A size in pixels at 100 % display scaling -> pixels on this display."""
+    return int(round(n * UI_SCALE))
 LEVEL_ICON = {"info": "ℹ", "ok": "✔", "warn": "⚠", "err": "✖", "in": "⬇", "out": "⬆", "tech": "·"}
 
 SETTINGS_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "HM30Link", "settings.json")
@@ -265,8 +287,8 @@ class App:
 
         root.title(title)
         set_icon(root)
-        root.geometry("1280x820")
-        root.minsize(1000, 640)
+        root.geometry(f"{px(1280)}x{px(820)}")
+        root.minsize(px(1000), px(640))
         root.configure(bg=C["bg"])
         self._style()
         self._build_ui()
@@ -285,7 +307,50 @@ class App:
 
     # ---- look ---------------------------------------------------------------
 
+    def _fonts(self) -> None:
+        from tkinter import font as tkfont
+        families = set(tkfont.families(self.root))
+        pick = {
+            "ui": next((f for f in ("Segoe UI Variable Text", "Segoe UI", "Helvetica") if f in families), "TkDefaultFont"),
+            "mono": next((f for f in ("Cascadia Mono", "Consolas", "Courier New") if f in families), "TkFixedFont"),
+            "symbol": next((f for f in ("Segoe UI Symbol", "Segoe UI") if f in families), "TkDefaultFont"),
+        }
+        self.fonts = {}
+        for name, (size, weight, slant, kind) in FONT_SPECS.items():
+            try:
+                f = tkfont.nametofont(name, root=self.root)
+                f.configure(family=pick[kind], weight=weight, slant=slant)
+            except tk.TclError:
+                f = tkfont.Font(root=self.root, name=name, family=pick[kind], weight=weight, slant=slant)
+            self.fonts[name] = f
+        self.zoom = float(self.settings.get("zoom", 1.0))
+        self._apply_zoom()
+
+    def _apply_zoom(self) -> None:
+        for name, (size, *_rest) in FONT_SPECS.items():
+            self.fonts[name].configure(size=max(8, round(size * self.zoom)))
+        line = self.fonts["f_base"].metrics("linespace")
+        ttk.Style(self.root).configure("Treeview", rowheight=line + px(10))
+
+    def change_zoom(self, step: int) -> str:
+        """Ctrl + / Ctrl - / Ctrl 0: make all text bigger / smaller / normal."""
+        if step == 0:
+            self.zoom = 1.0
+        else:
+            i = min(range(len(ZOOM_STEPS)), key=lambda k: abs(ZOOM_STEPS[k] - self.zoom))
+            self.zoom = ZOOM_STEPS[max(0, min(len(ZOOM_STEPS) - 1, i + step))]
+        self._apply_zoom()
+        self.settings["zoom"] = self.zoom
+        self._persist()
+        if hasattr(self, "zoom_lbl"):
+            self.zoom_lbl.configure(text=f"{self.zoom * 100:.0f}%")
+        if hasattr(self, "_plot"):
+            self._plot["sig"] = None  # redraw the graph with the new text size
+        return "break"
+
     def _style(self) -> None:
+        self._fonts()
+        self.root.option_add("*TCombobox*Listbox.font", "f_base")
         s = ttk.Style(self.root)
         s.theme_use("clam")
         s.configure(".", background=C["bg"], foreground=C["text"], font=FONT, bordercolor=C["border"],
@@ -293,14 +358,14 @@ class App:
         s.configure("TFrame", background=C["bg"])
         s.configure("Card.TFrame", background=C["card"], relief="flat", borderwidth=0)
         s.configure("Header.TFrame", background=C["header"])
-        s.configure("Header.TLabel", background=C["header"], foreground=C["header_text"], font=("Segoe UI", 14, "bold"))
-        s.configure("Sub.TLabel", background=C["header"], foreground="#94a3b8", font=("Segoe UI", 9))
+        s.configure("Header.TLabel", background=C["header"], foreground=C["header_text"], font="f_header")
+        s.configure("Sub.TLabel", background=C["header"], foreground="#cbd5e1", font="f_small")
         s.configure("TLabel", background=C["bg"])
         s.configure("Card.TLabel", background=C["card"])
-        s.configure("Muted.TLabel", background=C["bg"], foreground=C["muted"], font=("Segoe UI", 9))
-        s.configure("CardMuted.TLabel", background=C["card"], foreground=C["muted"], font=("Segoe UI", 9))
+        s.configure("Muted.TLabel", background=C["bg"], foreground=C["muted"], font="f_small")
+        s.configure("CardMuted.TLabel", background=C["card"], foreground=C["muted"], font="f_small")
         s.configure("Path.TLabel", background=C["card"], foreground=C["accent"])
-        s.configure("Title.TLabel", background=C["card"], font=("Segoe UI", 10, "bold"))
+        s.configure("Title.TLabel", background=C["card"], font="f_title")
         s.configure("TButton", padding=(10, 4), background="#e9edf3", relief="flat")
         s.map("TButton", background=[("active", "#dbe2ec"), ("disabled", "#f1f3f6")],
               foreground=[("disabled", "#9ca3af")])
@@ -316,7 +381,7 @@ class App:
         s.configure("TNotebook", background=C["card"], borderwidth=0, tabmargins=(4, 4, 4, 0))
         s.configure("TNotebook.Tab", padding=(16, 6), font=FONT, background="#e9edf3")
         s.map("TNotebook.Tab", background=[("selected", C["card"])], font=[("selected", FONT_BOLD)])
-        s.configure("Treeview", rowheight=26, fieldbackground="white", background="white", borderwidth=0)
+        s.configure("Treeview", fieldbackground="white", background="white", borderwidth=0)
         s.configure("Treeview.Heading", font=FONT_BOLD, background="#eef1f5", relief="flat")
         s.configure("Green.Horizontal.TProgressbar", troughcolor="#e5e7eb", background=C["ok"],
                     bordercolor="#e5e7eb", lightcolor=C["ok"], darkcolor=C["ok"], thickness=12)
@@ -339,6 +404,20 @@ class App:
         self.badge = tk.Label(header, text="● Disconnected", font=FONT_BOLD, fg="white", bg="#64748b",
                               padx=12, pady=3)
         self.badge.pack(side="right")
+        zoom = tk.Frame(header, bg=C["header"])
+        zoom.pack(side="right", padx=(0, 14))
+        for text, step in (("A−", -1), ("A+", 1)):
+            b = tk.Label(zoom, text=text, font="f_bold", fg="white", bg="#334155", padx=8, pady=2, cursor="hand2")
+            b.pack(side="left", padx=1)
+            b.bind("<Button-1>", lambda _e, k=step: self.change_zoom(k))
+        self.zoom_lbl = tk.Label(zoom, text=f"{self.zoom * 100:.0f}%", font="f_small", fg="#cbd5e1",
+                                 bg=C["header"], padx=6)
+        self.zoom_lbl.pack(side="left")
+        self.zoom_lbl.bind("<Button-1>", lambda _e: self.change_zoom(0))
+        for seq, step in (("<Control-plus>", 1), ("<Control-equal>", 1), ("<Control-KP_Add>", 1),
+                          ("<Control-minus>", -1), ("<Control-KP_Subtract>", -1), ("<Control-0>", 0)):
+            self.root.bind(seq, lambda _e, k=step: self.change_zoom(k))
+        self.root.bind("<Control-MouseWheel>", lambda e: self.change_zoom(1 if e.delta > 0 else -1))
 
         self.status = ttk.Label(self.root, padding=(14, 4, 14, 6), anchor="w", style="Muted.TLabel")
         self.status.pack(fill="x", side="bottom")
@@ -352,12 +431,12 @@ class App:
         row.pack(fill="x")
         ttk.Label(row, text="Port", style="Card.TLabel").pack(side="left")
         self.port_var = tk.StringVar()
-        self.port_box = ttk.Combobox(row, textvariable=self.port_var, width=48, state="readonly")
+        self.port_box = ttk.Combobox(row, textvariable=self.port_var, width=48, state="readonly", font="f_base")
         self.port_box.pack(side="left", padx=(6, 4))
         ttk.Button(row, text="⟳", width=3, command=self.refresh_ports).pack(side="left")
         ttk.Label(row, text="Baud", style="Card.TLabel").pack(side="left", padx=(16, 0))
         self.baud_var = tk.StringVar(value=str(self.settings.get("baud", "115200")))
-        baud_box = ttk.Combobox(row, textvariable=self.baud_var, values=BAUDS, width=8, state="readonly")
+        baud_box = ttk.Combobox(row, textvariable=self.baud_var, values=BAUDS, width=8, state="readonly", font="f_base")
         baud_box.pack(side="left", padx=6)
         baud_box.bind("<<ComboboxSelected>>", lambda _e: self._on_baud_change())
         self.connect_btn = ttk.Button(row, text="Connect", style="Accent.TButton", command=self.toggle_connect)
@@ -369,8 +448,10 @@ class App:
         row2 = ttk.Frame(conn, style="Card.TFrame")
         row2.pack(fill="x", pady=(8, 0))
         ttk.Label(row2, text="Received files and logs:", style="CardMuted.TLabel").pack(side="left")
-        self.folder_lbl = ttk.Label(row2, text="", style="Path.TLabel")
+        self.folder_lbl = ttk.Label(row2, text="", style="Path.TLabel", cursor="hand2")
         self.folder_lbl.pack(side="left", padx=6)
+        self.folder_lbl.bind("<Button-1>", lambda _e: self.open_save_dir())
+        self.folder_lbl.bind("<Enter>", lambda _e: self.status.configure(text="Folder: " + self._folder_tip))
         ttk.Button(row2, text="Change…", command=self.choose_save_dir).pack(side="left")
         ttk.Button(row2, text="Open folder", command=self.open_save_dir).pack(side="left", padx=6)
         self._show_save_dir()
@@ -381,11 +462,11 @@ class App:
         send.pack(fill="x")
         ttk.Label(send, text="Send", style="Title.TLabel").pack(side="left")
         self.send_mode = tk.StringVar(value=SEND_MODES[0])
-        mode_box = ttk.Combobox(send, textvariable=self.send_mode, values=SEND_MODES, width=15, state="readonly")
+        mode_box = ttk.Combobox(send, textvariable=self.send_mode, values=SEND_MODES, width=15, state="readonly", font="f_base")
         mode_box.pack(side="left", padx=(8, 0))
         mode_box.bind("<<ComboboxSelected>>", lambda _e: self._on_mode_change())
         self.send_var = tk.StringVar()
-        self.entry = ttk.Entry(send, textvariable=self.send_var, font=("Segoe UI", 11))
+        self.entry = ttk.Entry(send, textvariable=self.send_var, font="f_entry")
         self.entry.pack(side="left", fill="x", expand=True, padx=8)
         self.entry.bind("<Return>", lambda _e: self.send())
         self.entry.bind("<Up>", lambda _e: self._history_step(-1))
@@ -401,7 +482,7 @@ class App:
         self.hint.pack(side="left", fill="x", expand=True)
         self.progress_lbl = ttk.Label(prog, text="", style="Card.TLabel", anchor="e")
         self.progress_lbl.pack(side="right", padx=(10, 0))
-        self.progress = ttk.Progressbar(prog, length=280, mode="determinate", maximum=1000,
+        self.progress = ttk.Progressbar(prog, length=px(280), mode="determinate", maximum=1000,
                                         style="Green.Horizontal.TProgressbar")
         self.progress.pack(side="right")
         self._on_mode_change()
@@ -416,8 +497,8 @@ class App:
         left.pack(fill="both", expand=True, padx=1, pady=1)
         self.tabs = ttk.Notebook(left)
         self.tabs.pack(fill="both", expand=True)
-        self.chat = self._text_tab("  Chat  ", font=("Segoe UI", 10), bg="white", wrap="word")
-        self.log_text = self._text_tab("  Log  ", font=("Segoe UI", 9), bg="#fbfcfe", wrap="word")
+        self.chat = self._text_tab("  Chat  ", font="f_base", bg="white", wrap="word")
+        self.log_text = self._text_tab("  Log  ", font="f_small", bg="#fbfcfe", wrap="word")
         self._build_transfers_tab()
         self._chat_tags()
         self._log_tags()
@@ -462,7 +543,7 @@ class App:
         ttk.Label(bar, text="Graph", style="Title.TLabel").pack(side="left")
         self.window_var = tk.StringVar(value="30 s")
         ttk.Combobox(bar, textvariable=self.window_var, values=["10 s", "30 s", "60 s", "5 min"], width=7,
-                     state="readonly").pack(side="right")
+                     state="readonly", font="f_base").pack(side="right")
         ttk.Label(bar, text="last", style="CardMuted.TLabel").pack(side="right", padx=4)
         self.canvas = tk.Canvas(plot, bg="white", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, pady=(6, 0))
@@ -514,18 +595,18 @@ class App:
 
     def _chat_tags(self) -> None:
         c = self.chat
-        c.tag_configure("time", foreground="#9ca3af", font=("Segoe UI", 8))
+        c.tag_configure("time", foreground=C["faint"], font="f_small")
         c.tag_configure("me", background=C["me_bg"], foreground=C["me_fg"], justify="right",
-                        lmargin1=140, lmargin2=140, rmargin=10, spacing1=4, spacing3=4)
+                        lmargin1=px(140), lmargin2=px(140), rmargin=px(10), spacing1=px(5), spacing3=px(5))
         c.tag_configure("them", background=C["them_bg"], foreground=C["them_fg"], justify="left",
-                        lmargin1=10, lmargin2=10, rmargin=140, spacing1=4, spacing3=4)
-        c.tag_configure("who", font=("Segoe UI", 8, "bold"), foreground="#9ca3af", spacing1=8)
+                        lmargin1=px(10), lmargin2=px(10), rmargin=px(140), spacing1=px(5), spacing3=px(5))
+        c.tag_configure("who", font="f_small_bold", foreground=C["faint"], spacing1=px(10))
         c.tag_configure("me_head", justify="right", rmargin=10)
         c.tag_configure("them_head", justify="left", lmargin1=10)
         c.tag_configure("link", foreground=C["accent"], underline=True)
         c.tag_bind("link", "<Enter>", lambda _e: c.configure(cursor="hand2"))
         c.tag_bind("link", "<Leave>", lambda _e: c.configure(cursor="arrow"))
-        c.tag_configure("center", justify="center", foreground=C["muted"], font=("Segoe UI", 9, "italic"),
+        c.tag_configure("center", justify="center", foreground=C["muted"], font="f_italic",
                         spacing1=8, spacing3=8)
         c.tag_configure("file", foreground="#92400e")
         c.tag_configure("ok", foreground=C["ok"], font=FONT_BOLD)
@@ -533,11 +614,11 @@ class App:
 
     def _log_tags(self) -> None:
         lg = self.log_text
-        lg.tag_configure("time", foreground="#9ca3af", font=("Consolas", 9))
+        lg.tag_configure("time", foreground=C["faint"], font="f_mono")
         for level in ("info", "ok", "warn", "err", "in", "out"):
             lg.tag_configure(level, foreground=C[level])
-        lg.tag_configure("icon", font=("Segoe UI Symbol", 10, "bold"))
-        lg.tag_configure("tech", foreground="#9ca3af", font=("Consolas", 9), elide=True)
+        lg.tag_configure("icon", font="f_icon")
+        lg.tag_configure("tech", foreground=C["faint"], font="f_mono", elide=True)
 
     def _apply_tech(self) -> None:
         self.log_text.tag_configure("tech", elide=not self.tech_var.get())
@@ -552,7 +633,10 @@ class App:
         return bool(d) and os.path.isdir(d)
 
     def _show_save_dir(self) -> None:
-        self.folder_lbl.configure(text=self.save_dir() + ("" if self._save_dir_ok() else "   (not chosen yet)"))
+        full = self.save_dir()
+        short = full if len(full) <= 60 else full[:22] + " … " + full[-34:]
+        self.folder_lbl.configure(text=short + ("" if self._save_dir_ok() else "   (not chosen yet)"))
+        self._folder_tip = full
 
     def choose_save_dir(self, first_time: bool = False) -> None:
         if first_time:
@@ -805,7 +889,10 @@ class App:
         except queue.Empty:
             pass
         for widget in self._scroll:  # scroll once per slice, not once per line
-            widget.see("end")
+            if widget is self.chat:
+                self._smooth_scroll(widget)
+            else:
+                widget.see("end")
         self._scroll.clear()
         more = not self.events.empty()
         self.root.after(5 if more else 50, self.poll_events)
@@ -872,12 +959,10 @@ class App:
             s.vmin = min(s.vmin, value)
             s.vmax = max(s.vmax, value)
             self._record(stamp, "in", "value", name, f"{value:.6g}")
-            if peer_app:  # an STM32 streams values all the time: keep those out of chat and log
+            if peer_app:  # an STM32 streams values all the time: those only go to the table, graph and CSV
                 self.note("in", f"Number: {clip(name)} = {value:.6g}")
                 self.chat_bubble("them", f"{clip(name)} = {value:.6g}", ts)
                 self.alert("number")
-            else:
-                self.note("tech", f"value {clip(name)} = {value:.6g}", tech=True)
         elif t == proto.TYPE_BYTES:
             hexs = item.payload.hex(" ")
             self.note("in", f"Bytes ({len(item.payload)}): {clip(hexs)}")
@@ -1349,12 +1434,52 @@ class App:
                 self.files_left.remove(path)
             self.add_transfer("out", info["name"], info.get("size", 0), None, "✖ not delivered", path, "bad")
 
+    def _set_progress(self, value: float) -> None:
+        """Glide the progress bar to `value` (0..1000) instead of jumping every 0.2 s."""
+        self._prog_target = value
+        if not getattr(self, "_prog_anim", False):
+            self._prog_anim = True
+            self._animate_progress()
+
+    def _animate_progress(self) -> None:
+        cur, target = float(self.progress["value"]), self._prog_target
+        if target < cur or abs(target - cur) < 1.5:  # a new file starts at 0: no backwards animation
+            self.progress["value"] = target
+            self._prog_anim = False
+            return
+        self.progress["value"] = cur + max((target - cur) * 0.18, 1.0)
+        self.root.after(16, self._animate_progress)
+
+    def _smooth_scroll(self, w: tk.Text) -> None:
+        """Glide to the newest line (about 0.1 s) instead of jumping."""
+        first, last = w.yview()
+        if last >= 0.9999 or getattr(w, "_gliding", False):
+            if not getattr(w, "_gliding", False):
+                w.see("end")
+            return
+        target, steps = 1.0 - (last - first), 7
+        if target - first > 0.5:  # far away (e.g. after Clear or a long pause): just jump
+            w.see("end")
+            return
+        w._gliding = True
+
+        def step(i: int) -> None:
+            if i >= steps:
+                w.yview_moveto(1.0)
+                w._gliding = False
+                return
+            ease = 1 - (1 - i / steps) ** 3
+            w.yview_moveto(first + (target - first) * ease)
+            self.root.after(16, step, i + 1)
+
+        step(1)
+
     def show_progress(self, p: dict | None, done_text: str | None = None) -> None:
         if p is None:
-            self.progress["value"] = 0
+            self._set_progress(0)
             self.progress_lbl.configure(text="")
             return
-        self.progress["value"] = int(1000 * p["frac"])
+        self._set_progress(1000 * p["frac"])
         if done_text:
             self.progress_lbl.configure(text=done_text)
             return
@@ -1382,13 +1507,21 @@ class App:
             if not s.points:
                 continue
             t, v = s.points[-1]
+            age = now - t
             vals = ("● on" if s.plot else "off", f"{v:.4g}", f"{s.vmin:.4g}", f"{s.vmax:.4g}", s.count,
-                    f"{now - t:.1f}")
-            if self.table.exists(name):
+                    f"{age:.0f}" if age >= 10 else f"{age:.1f}")
+            cache = self.__dict__.setdefault("_table_cache", {})
+            if cache.get(name) == vals:
+                continue  # nothing changed: do not touch the row (no flicker, less work)
+            if name in cache and self.table.exists(name):
                 self.table.item(name, values=vals)
             else:
-                self.table.insert("", "end", iid=name, text=name, values=vals, tags=(name,))
-            self.table.tag_configure(name, foreground=s.color)
+                if not self.table.exists(name):
+                    self.table.insert("", "end", iid=name, text=name, values=vals, tags=(name,))
+                    self.table.tag_configure(name, foreground=s.color)
+                else:
+                    self.table.item(name, values=vals)
+            cache[name] = vals
 
         w = self.worker
         st = w.parser.stats if w else proto.ParserStats()
@@ -1459,57 +1592,126 @@ class App:
             self.note("warn", f"Weak link: {resent} packets had to be re-sent in the last 10 s (they still arrive, "
                               "just slower). Try moving the units or the antennas.")
 
-    def redraw_plot(self) -> None:
-        c = self.canvas
-        c.delete("all")
-        w, h = c.winfo_width(), c.winfo_height()
-        if w > 50 and h > 50:
-            self._draw_plot(c, w, h)
-        self.root.after(150, self.redraw_plot)
+    # The graph keeps its drawn items and only moves them (Canvas.coords) instead of deleting and
+    # re-creating everything; the grid is rebuilt only when the size or time window changes, and the
+    # y-axis range glides to new values instead of jumping.
 
-    def _draw_plot(self, c: tk.Canvas, w: int, h: int) -> None:
+    def redraw_plot(self) -> None:
+        busy = False
+        try:
+            if self.canvas.winfo_viewable():
+                busy = self._draw_plot()
+        except tk.TclError:
+            pass
+        if busy:  # just often enough that the lines move ~1 pixel per frame (smooth, but no wasted frames)
+            span = {"10 s": 10, "30 s": 30, "60 s": 60, "5 min": 300}.get(self.window_var.get(), 30)
+            ms = int(1000 * span / max(self.canvas.winfo_width() - px(80), 100))
+            delay = min(max(ms, PLOT_MS), PLOT_IDLE_MS * 2)
+        else:
+            delay = PLOT_IDLE_MS
+        self.root.after(delay, self.redraw_plot)
+
+    def _plot_reset(self, state: str, sig) -> None:
+        self.canvas.delete("all")
+        self._plot = {"state": state, "sig": sig, "lines": {}, "ylabels": [], "legend_key": None,
+                      "lo": None, "hi": None, "shown_rng": None}
+
+    def _draw_plot(self) -> bool:
+        """Returns True while there is something moving on the graph."""
+        c = self.canvas
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 60 or h < 60:
+            return False
         span = {"10 s": 10, "30 s": 30, "60 s": 60, "5 min": 300}.get(self.window_var.get(), 30)
         now = time.monotonic()
         t_start = now - span
-        visible = {n: [(t, v) for t, v in s.points if t >= t_start] for n, s in self.series.items() if s.plot}
-        visible = {n: p for n, p in visible.items() if p}
-        left, right, top, bottom = 60, 12, 26, 24
-        pw, ph = w - left - right, h - top - bottom
+        visible: dict[str, list] = {}
+        for name, s in self.series.items():
+            if not s.plot or not s.points:
+                continue
+            pts = []
+            for t, v in reversed(s.points):  # newest first; stop at the left edge of the window
+                if t < t_start:
+                    break
+                pts.append((t, v))
+            if pts:
+                pts.reverse()
+                visible[name] = pts
+        sig = (w, h, span)
+        P = getattr(self, "_plot", None)
         if not visible:
-            c.create_text(w / 2, h / 2, text="No numbers yet — values sent by the other side appear here",
-                          fill="#9ca3af", font=("Segoe UI", 10))
-            return
+            if P is None or P["state"] != "empty" or P["sig"] != sig:
+                self._plot_reset("empty", sig)
+                c.create_text(w / 2, h / 2, text="No numbers yet — values sent by the other side appear here",
+                              fill=C["faint"], font="f_base")
+            return False
+
+        lh = self.fonts["f_small"].metrics("linespace")
+        left = self.fonts["f_small"].measure("-000.00") + px(14)
+        right, top, bottom = px(14), lh + px(16), lh + px(10)
+        pw, ph = w - left - right, h - top - bottom
+        if P is None or P["state"] != "plot" or P["sig"] != sig:  # static grid: only on resize / new window
+            self._plot_reset("plot", sig)
+            P = self._plot
+            for i in range(5):
+                y = top + ph * i / 4
+                c.create_line(left, y, left + pw, y, fill=C["grid"])
+                P["ylabels"].append(c.create_text(left - 8, y, text="", anchor="e", fill=C["muted"],
+                                                  font="f_small"))
+            for i in range(6):
+                x = left + pw * i / 5
+                c.create_line(x, top, x, top + ph, fill=C["grid"])
+                c.create_text(x, top + ph + lh // 2 + px(5), text=f"-{span * (5 - i) / 5:.0f}s" if i < 5 else "now",
+                              fill=C["muted"], font="f_small")
+
         lo = min(v for p in visible.values() for _, v in p)
         hi = max(v for p in visible.values() for _, v in p)
         if hi - lo < 1e-9:
             lo, hi = lo - 1, hi + 1
         pad = (hi - lo) * 0.08
         lo, hi = lo - pad, hi + pad
-        for i in range(5):
-            y = top + ph * i / 4
-            c.create_line(left, y, left + pw, y, fill=C["grid"])
-            c.create_text(left - 8, y, text=f"{hi - (hi - lo) * i / 4:.4g}", anchor="e", fill=C["muted"],
-                          font=("Segoe UI", 8))
-        for i in range(6):
-            x = left + pw * i / 5
-            c.create_line(x, top, x, top + ph, fill=C["grid"])
-            c.create_text(x, top + ph + 12, text=f"-{span * (5 - i) / 5:.0f}s" if i < 5 else "now",
-                          fill=C["muted"], font=("Segoe UI", 8))
-        lx = left
+        if P["lo"] is None:
+            P["lo"], P["hi"] = lo, hi
+        else:  # glide toward the new range
+            P["lo"] += (lo - P["lo"]) * 0.25
+            P["hi"] += (hi - P["hi"]) * 0.25
+            P["lo"], P["hi"] = min(P["lo"], lo), max(P["hi"], hi)  # never cut off a point
+        lo, hi = P["lo"], P["hi"]
+        rng = tuple(f"{hi - (hi - lo) * i / 4:.4g}" for i in range(5))
+        if rng != P["shown_rng"]:
+            P["shown_rng"] = rng
+            for item, text in zip(P["ylabels"], rng):
+                c.itemconfigure(item, text=text)
+
         for name, pts in visible.items():
-            s = self.series[name]
-            step = max(1, len(pts) // pw)
+            step = max(1, len(pts) // max(pw // 2, 1))  # at most one point per 2 pixels
             coords = []
             for t, v in pts[::step]:
                 coords += [left + pw * (t - t_start) / span, top + ph * (hi - v) / (hi - lo)]
-            if len(coords) >= 4:
-                c.create_line(*coords, fill=s.color, width=2, smooth=False)
+            if len(coords) < 4:  # one point: a short dash
+                coords += [coords[0] + 4, coords[1]]
+            item = P["lines"].get(name)
+            if item is None:
+                P["lines"][name] = c.create_line(*coords, fill=self.series[name].color, width=2,
+                                                 capstyle="round", joinstyle="round")
             else:
-                c.create_oval(coords[0] - 3, coords[1] - 3, coords[0] + 3, coords[1] + 3, fill=s.color, outline="")
-            label = f"{name}  {pts[-1][1]:.4g}"
-            c.create_oval(lx, 8, lx + 9, 17, fill=s.color, outline="")
-            c.create_text(lx + 14, 12, text=label, anchor="w", fill=C["text"], font=("Segoe UI", 9, "bold"))
-            lx += 34 + 7 * len(label)
+                c.coords(item, *coords)
+        for name in [n for n in P["lines"] if n not in visible]:
+            c.delete(P["lines"].pop(name))
+
+        labels = tuple((name, f"{name}  {pts[-1][1]:.4g}") for name, pts in visible.items())
+        if labels != P["legend_key"]:
+            P["legend_key"] = labels
+            c.delete("legend")
+            lx = left
+            for name, label in labels:
+                ly = px(4) + lh // 2
+                c.create_oval(lx, ly - px(5), lx + px(10), ly + px(5), fill=self.series[name].color, outline="",
+                              tags="legend")
+                t = c.create_text(lx + px(15), ly, text=label, anchor="w", fill=C["text"],
+                                  font="f_small_bold", tags="legend")
+                lx = c.bbox(t)[2] + 18
+        return True
 
     # ---- misc ---------------------------------------------------------------
 
@@ -1527,6 +1729,7 @@ class App:
         self.chat_marks.clear()
         self.series.clear()
         self.table.delete(*self.table.get_children())
+        self.__dict__.pop("_table_cache", None)
         self.csv_rows.clear()
         self.rate_hist.clear()
         self.noise_bytes = 0
@@ -1558,7 +1761,19 @@ def main() -> None:
     ap.add_argument("--pair", action="store_true", help="two windows joined by a simulated radio")
     ap.add_argument("--loss", type=float, default=0.05, help="--pair: packet loss per direction (0..1)")
     args = ap.parse_args()
+    if sys.platform.startswith("win"):  # draw at the real screen resolution: sharp text when Windows scales
+        try:
+            import ctypes
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except (AttributeError, OSError):
+                ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
     root = tk.Tk()
+    global UI_SCALE
+    UI_SCALE = max(1.0, root.winfo_fpixels("1i") / 96)
+    root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72)
     if args.pair:
         a, b = core.make_pair(loss=args.loss)
         base = os.path.join(os.path.expanduser("~"), "Documents", "HM30 Received (pair test)")
